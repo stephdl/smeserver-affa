@@ -4,7 +4,7 @@ Name: %{name}
 %define version 3.2.2.2
 %define release 0
 Version: %{version}
-Release: %{release}
+Release: %{release}%{?dist}
 Vendor: Michael Weinberger <mweinber AT users DOT sourceforge DOT net> //// adaptation to sme-server Arnaud Guillaume <smeserver-affa AT guedel DOT eu>
 License: GNU General Public License
 Group: Applications/Archiving
