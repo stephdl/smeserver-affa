@@ -33,7 +33,7 @@ with SMEServer + RPMCheck + Watchdog + rise
 %install
 rm -rf $RPM_BUILD_ROOT
 rm -f %{name}-%{version}-filelist
-(find . -depth -print | cpio -dump $RPM_BUILD_ROOT)
+(cd root   ;find . -depth -print | cpio -dump $RPM_BUILD_ROOT)
 
 
 # Set version String
