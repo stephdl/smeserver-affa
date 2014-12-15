@@ -1,0 +1,4273 @@
+#!/usr/bin/perl -w
+
+#----------------------------------------------------------------------
+# Affa is a rsync based backup program for Linux.
+# It remotely backups Linux or other systems, which have either the rsync
+# program and the sshd service or the rsyncd service installed.
+# Please see http://affa.sf.net for full documentation.
+# Copyright (C) 2004-2012 by Michael Weinberger
+# This program comes with ABSOLUTELY NO WARRANTY; for details type 'affa --warranty'.
+# This is free software, and you are welcome to redistribute it
+# under certain conditions; type 'affa --license' for details.
+#----------------------------------------------------------------------
+my $VERSION='3.2.2-2';
+#----------------------------------------------------------------------
+
+use strict;
+use Date::Format;
+use Errno;
+use File::Path;
+use File::stat;
+use File::Copy;
+use Digest::MD5;
+use Cwd;
+use Filesys::DiskFree;
+use Getopt::Long;
+use Mail::Send;
+use Time::Local;
+use Sys::Hostname;
+use Config::IniFiles;
+use Proc::ProcessTable;
+##########################
+#ajoute
+use esmith::Backup;
+use esmith::ConfigDB;
+# ajout pour V3.2.2-2
+use File::Basename;
+#use Affa::lib qw(ExecCmd setlog lg dbg);
+########use Affa::lib qw(ExecCmd setlog lg dbg);
+
+#fin ajout
+#########################
+
+$|=1; # flush output
+
+$ENV{LANG} = "en_US"; # Filesys::DiskFree only works with english LANG setting
+
+# prototypes
+sub affaErrorExit($);
+sub affaExit($);
+sub checkArchiveExists($$);
+sub checkConfig();
+sub checkConnection($);
+sub checkConnectionsAll();
+sub checkConnection_silent($$$);
+
+# ajout pour V3.2.2-2
+sub checkForDiskLabel($);
+# fin ajout
+
+sub checkCrossFS($$);
+sub cleanup();
+sub convertReportV2toV3($$);
+sub cronSetup();
+sub dbg( $ );
+sub dbg($);
+sub deduplicate($);
+sub deleteJob();
+sub df($);
+sub DiskSpaceWarn();
+sub DiskUsage();
+sub DiskUsageRaw();
+sub ExecCmd( \@$ );
+sub execJobCommand($$);
+sub execJobCommandRemote($$);
+sub execPostJobCommand($);
+sub execPreJobCommand($);
+sub	fullRestore();
+sub getChildProcess($$);
+sub getConfigFile($);
+sub getConfigFileList();
+sub findProcessId($$);
+sub getExcludedString();
+sub getIncludedString();
+sub getJobConfig($);
+sub getJobs();
+sub getLinkdest($$);
+sub getLock($);
+sub getMultivalueKeys();
+sub getProcessState($);
+sub getReportVal($$);
+sub getSourceDirs($);
+sub getSourceDirsString($);
+sub getStatus();
+sub getStatusRaw();
+sub isMounted($$);
+sub killall();
+sub killJob($);
+sub killProcessGroup($$);
+sub lg( $ );
+sub lg($);
+sub listArchives();
+sub listArchivesRaw($);
+sub listJobs();
+sub jobsnrpe($);
+sub logTail();
+sub mailTest();
+sub mount($$$);
+sub moveArchive();
+sub moveFileorDir($$);
+sub nrpe();
+sub remoteCopy($$$);
+sub removeDir($$);
+sub removeLock();
+sub renameConfigKey($$$);
+sub renameJob();
+sub resumeInterrupted();
+sub revokeKeys($);
+sub sendErrorMesssage();
+sub sendKeys();
+sub sendStatus();
+sub sendSuccessMesssage();
+sub setLock();
+sub setlog( $ );
+sub setupSamba();
+sub shiftArchives();
+sub showConfigPathes();
+sub showConfigPathesRaw();
+sub showDefaults();
+sub showHelp($);
+sub showProperty();
+sub showSchedule();
+sub showTextfile($);
+sub showVersion();
+sub SignalHandler();
+sub trim($);
+sub unmount($$);
+sub writeConfigFile($);
+
+####################################################################################
+########### ajouts
+sub compareRPMLists($);
+sub imapIndexFilesDelete();
+sub imapIndexFilesDeleteCommand();
+sub installedRPMsList($);
+sub installWatchdog($);
+sub mailTestWatchdogRemote($);
+sub riseFromDeath();
+sub runRiseRsync($$$);
+sub saveMySoul();
+sub undoRise();
+
+########## fin ajouts
+###################################################################################
+
+
+
+
+
+
+my $allow_retry=0;
+my $defaultEmail='admin';
+
+my $SystemName=hostname();
+(my $Domain=$SystemName)=~s/([^\.]*)\.//;
+#####################################################################################################################
+################################################début modifs
+#my $hostname=$1;
+my $hostname=$SystemName ;
+################################################# fin modifs
+########################################################################################################################
+my $affaTitle="Affa version $VERSION on $SystemName";
+my $smbconf='/etc/samba/smb.conf';
+my $SambaStartScript='/etc/init.d/smb';
+my $NRPEStartScript='/etc/init.d/nrpe';
+my $dedupBinary='/usr/bin/freedup';
+
+my $cfg; # ini file
+
+my $curtime=time(); # now timestamp
+my $thisDay=time2str("%Y%j",$curtime); # day of year 1-366
+my $thisWeek=time2str("%Y%W",$curtime); # week of year 1-53
+my $thisMonth=time2str("%Y%m",$curtime); # month 1-12
+my $thisYear=time2str("%Y",$curtime); # 4-digit year
+my $process_id=$$; # my PID
+my $jobname='NONE';
+my $Command = '';
+my $interactive=0;
+my %autoMounted=();
+my $interrupt='';
+my $ExecCmdOutout='';
+my @Messages=(); # List of all log messages
+my $logdir = '/var/log/affa'; # Logdir
+my $logfile = "$logdir/affa-GLOBAL-LOGFILE.log"; # Logfile
+my $lockdir = '/var/lock/affa'; # Process lock
+File::Path::mkpath( $lockdir, 0, 0700 ) if not -d $lockdir;
+my $scriptdir='/etc/affa/scripts';
+
+###################################################################################
+################ ajouts
+
+my $config = esmith::ConfigDB->open or die "Error: Couldn't open config db.";
+my $LocalIP=$config->get("LocalIP")->value;
+my $DomainName=$config->get("DomainName")->value;
+
+my $rpmlist="/home/e-smith/db/affa-rpmlist"; # list of installed RPMs
+
+my @services=('crond','smb','atalk','qmail','qpsmtpd','sqpsmtpd');
+
+my $ServicesStopped=0;
+
+my $sshQuiet="-q";
+
+my $ServerBasename="AFFA.$SystemName.$DomainName-$LocalIP";
+
+
+############## fin ajouts
+####################################################################################
+
+
+if ( not $ARGV[0] ) {
+	showHelp(1);
+	exit;
+}
+
+my %opts;
+my $runninglog="Affa $VERSION: Running $0 @ARGV";
+my $getRes = GetOptions( 
+	'15'=>\$opts{'15'},
+	'30'=>\$opts{'30'},
+	'all'=>\$opts{'all'},
+	'backup'=>\$opts{'run'}, # same as --run
+	'check-connections'=>\$opts{'check-connections'},
+	'cleanup'=>\$opts{'cleanup'},
+	'csv'=>\$opts{'csv'},
+	'configcheck'=>\$opts{'configcheck'},
+	'nrpe'=>\$opts{'nrpe'},
+	'debug'=>\$opts{'debug'},
+	'delete-job'=>\$opts{'delete-job'},
+	'disk-usage'=>\$opts{'disk-usage'},
+	'full-restore'=>\$opts{'full-restore'},
+	'help'=>\$opts{'help'},
+	'_jobs'=>\$opts{'jobs'},
+	'_jobsnrpe'=>\$opts{'jobsnrpe'},
+	'init-nrpe'=>\$opts{'init-nrpe'},
+	'_cronupdate'=>\$opts{'cronupdate'},
+	'killall'=>\$opts{'killall'},
+	'kill'=>\$opts{'kill'},
+	'resume=s'=>\$opts{'resume'},
+	'list-archives'=>\$opts{'list-archives'},
+	'preserve-newer=s'=>\$opts{'preserve-newer'},
+	'delete=s'=>\$opts{'delete'},
+	'_delay=s'=>\$opts{'delay'},
+	'log-tail'=>\$opts{'log-tail'},
+	'mailtest'=>\$opts{'mailtest'},
+	'make-cronjobs'=>\$opts{'make-cronjobs'},
+	'move-archive'=>\$opts{'move-archive'},
+	'outfile=s'=>\$opts{'outfile'},
+	'rename-job'=>\$opts{'rename-job'},
+	'RetryAfter=s'=>\$opts{'RetryAfter'},
+	'RetryAttempts=s'=>\$opts{'RetryAttempts'},
+	'revoke-key'=>\$opts{'revoke-key'},
+	'run'=>\$opts{'run'},
+	'send-keys'=>\$opts{'send-keys'},
+	'send-status'=>\$opts{'send-status'},
+	'_shorthelp'=>\$opts{'shorthelp'},
+	'show-config-pathes'=>\$opts{'show-config-pathes'},
+	'show-property'=>\$opts{'show-property'},
+	'show-schedule'=>\$opts{'show-schedule'},
+	'show-default-config'=>\$opts{'show-default-config'},
+	'status'=>\$opts{'status'},
+	'resume-interrupted'=>\$opts{'resume-interrupted'},
+	'version'=>\$opts{'version'},
+	'warranty'=>\$opts{'warranty'},
+	'license'=>\$opts{'license'},
+	'silent'=>\$opts{'silent'},
+	'watchdog=s'=>\$opts{'watchdog'},
+	"rise"=>\$opts{'rise'},
+	"undo-rise"=>\$opts{'undo-rise'},
+);
+
+########################################################################################### ajouté paramètre watchdog=s + rise + undo-rise 2 lignes plus haut
+
+
+
+my $configfile="/tmp/affa-config-$curtime-$$";
+unlink($configfile);
+
+my %job=getJobConfig(''); # default config
+
+if( $opts{'nrpe'} ) {
+	exit nrpe();
+}
+
+if( $opts{'cronupdate'} ) {
+	$interactive=1;
+	cronSetup();
+	exit 0;
+}
+
+if( $opts{'version'} ) {
+	showVersion();
+	exit 0;
+}
+if( $opts{'license'} ) {
+	showTextfile('/usr/lib/affa/LICENSE');
+	exit 0;
+}
+if( $opts{'warranty'} ) {
+	showTextfile('/usr/lib/affa/WARRANTY');
+	exit 0;
+}
+if( $opts{'help'} ) {
+	showHelp(0);
+	exit 0;
+}
+if( $opts{'jobs'} ) {
+	listJobs();
+	exit 0;
+}
+if( $opts{'init-nrpe'} ) {
+	jobsnrpe(1);
+	exit 0;
+}
+if( $opts{'jobsnrpe'} ) {
+	exit jobsnrpe(0);
+}
+if( $opts{'shorthelp'} ) {
+	showHelp(1);
+	exit 0;
+}
+
+#lg( $runninglog ); $runninglog='';
+
+if( $opts{'list-archives'} ) {
+	print listArchives();
+	affaExit('Done.');
+} elsif( $opts{'show-config-pathes'} ) {
+	undef $jobname;
+	showConfigPathes();
+	affaExit('Done.');
+} elsif( $opts{'show-default-config'} ) {
+	undef $jobname;
+	showDefaults();
+	affaExit('Done.');
+} elsif( $opts{'log-tail'} ) {
+	undef $jobname;
+	logTail();
+	affaExit('Done.');
+} elsif( $opts{'configcheck'} ) {
+	undef $jobname;
+	checkConfig();
+	affaExit('Done.');
+} elsif( $opts{'send-keys'} ) {
+	$jobname = 'send keys';
+	sendKeys();
+	affaExit('Done.');
+} elsif( $opts{'disk-usage'} ) {
+	undef $jobname;
+	print DiskUsage();
+	affaExit('Done.');
+} elsif( $opts{'status'} ) {
+	undef $jobname;
+	print getStatus();
+	affaExit('Done.');
+} elsif( $opts{'send-status'} ) {
+	undef $jobname;
+	sendStatus();
+	affaExit('Done.');
+} elsif( $opts{'mailtest'} ) {
+	mailTest();
+	affaExit('Done.');
+} elsif( $opts{'full-restore'} ) {
+	fullRestore();
+	affaExit('Done.');
+} elsif( $opts{'resume-interrupted'} ) {
+	resumeInterrupted();
+	affaExit('Done.');
+} elsif( $opts{'cleanup'} ) {
+	cleanup();
+	affaExit('Done.');
+} elsif( $opts{'delete-job'} ) {
+	deleteJob();
+	affaExit('Done.');
+} elsif( $opts{'rename-job'} ) {
+	renameJob();
+	affaExit('Done.');
+} elsif( $opts{'move-archive'} ) {
+	moveArchive();
+	affaExit('Done.');
+} elsif( $opts{'revoke-key'} ) {
+	$jobname = 'revoke key';
+	revokeKeys($ARGV[0]||'');
+	affaExit('Done.');
+} elsif( $opts{'check-connections'} ) {
+	$jobname = 'check-connections';
+	checkConnectionsAll();
+	affaExit('Done.');
+} elsif( $opts{'kill'} ) {
+	killJob($ARGV[0]||'');
+	affaExit('Done.');
+} elsif( $opts{'killall'} ) {
+	killall();
+	affaExit('Done.');
+} elsif( $opts{'show-schedule'} ) {
+	showSchedule();
+	affaExit('Done.');
+} elsif( $opts{'show-property'} ) {
+	showProperty();
+	affaExit('Done.');
+}
+##########################################################################################################################
+########################################### début des modifs: ajout de
+elsif( $opts{'rise'} )
+	{
+	$jobname = 'rising from archive';
+	riseFromDeath();
+	affaExit('Done.');
+	}
+
+elsif( $opts{'undo-rise'} )
+	{
+	$jobname = 'undo-rise';
+	undoRise();
+	affaExit('Done.');
+	}
+
+########################################### fin des modifs
+############################################################################################################################
+
+
+if( $opts{'make-cronjobs'} ) {
+	$jobname = 'make cronjobs';
+	cronSetup();
+	affaExit('Done.');
+}
+
+if ( not $opts{'run'} ) {
+	print "Run affa --help for help.\n";
+	affaErrorExit( "Unkown option.");
+}
+
+
+
+# run job
+
+my $StartTime=time();
+$jobname = $ARGV[0]||'';
+$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+if( not $cfg->SectionExists($jobname) )
+	{
+	my $txt= "Job '$jobname' undefined."; print("$txt\n");
+	affaErrorExit( "$txt" );
+	}
+
+$Command =  defined $ARGV[1] ? lc($ARGV[1]) : 'scheduled';
+$Command =~ /([a-z]*)/i; $Command = $1; # untaint
+if( not $Command =~ /^(scheduled|daily|weekly|monthly|yearly)$/ )
+	{
+	affaErrorExit( "Unkown command '$Command'");
+	}
+
+%job=getJobConfig( $jobname );
+setlog( "$jobname.log" );
+{my $txt="# Affa $VERSION #"; lg( '#' x length($txt) ); lg($txt); lg( '#' x length($txt) )}
+lg( "Starting job $jobname $Command ($job{'remoteHostName'})" );
+lg( "Description: ".$job{'Description'} ) if defined $job{'Description'};
+lg( "Bandwidth limit: $job{'BandwidthLimit'} KBytes/sec") if $job{'BandwidthLimit'};
+
+# check whether the job is already running
+$Command eq "scheduled" and getLock($jobname) 
+	and affaErrorExit( "Lock found. Another job (pid=" . getLock($jobname) . ") is still running." );
+
+setLock() if $Command eq "scheduled";
+$SIG{'TERM'} = 'SignalHandler';
+$SIG{'INT'} = 'SignalHandler';
+
+if( $opts{'delay'} ) {
+	lg( "Delayed run. Starting at " . Date::Format::time2str("%T",time()+$opts{'delay'}) );
+	sleep( $opts{'delay'} );
+}
+
+if( $opts{'RetryAfter'} )
+	{
+	lg( "Waiting $opts{'RetryAfter'} seconds. Continuing at " . Date::Format::time2str("%T",time()+$opts{'RetryAfter'}) );
+	sleep( $opts{'RetryAfter'} );
+	$job{'chattyOnSuccess'}++ if not $job{'chattyOnSuccess'} and $job{'RetryNotification'} eq 'yes';
+	}
+$allow_retry=1;
+checkConnection($jobname); # and exit on error
+
+# mount root dir
+if( $job{'AutomountDevice'} and $job{'AutomountPoint'} )
+	{
+	mount( $job{'AutomountDevice'},  $job{'AutomountPoint'}, $job{'AutomountOptions'} );
+	}
+
+affaErrorExit("RootDir $job{'RootDir'} does not exist") unless -d $job{'RootDir'};
+File::Path::mkpath( "$job{'RootDir'}/$jobname", 0, 0700 ) unless -d "$job{'RootDir'}/$jobname";
+
+my $ddf="$job{'RootDir'}/$jobname/.doneDates";
+if( not -f $ddf ) {
+	open( DF, ">$ddf"); 
+	print DF "[doneDates]\n";
+	print DF "daily=-1\n";
+	print DF "weekly=-1\n";
+	print DF "monthly=-1\n";
+	print DF "yearly=-1\n";
+	close(DF);
+}
+$job{'_doneDates'} = Config::IniFiles->new( -file => "$job{'RootDir'}/$jobname/.doneDates", -nocase => 0);
+# run daily, weekly, monthly or yearly if not already done;
+if( $Command eq "scheduled" and -f "$job{'RootDir'}/$jobname/scheduled.0/.AFFA3-REPORT" )
+	{
+	$0 =~ /(.*)/; # untaint
+	my @cmd=($1, '--run', $jobname, 'yearly' );
+	ExecCmd(  @cmd, 1 ) if( $job{'_doneDates'}->val('doneDates','yearly') ne $thisYear and $job{'yearlyKeep'}>0 );
+	$cmd[3]='monthly';
+	ExecCmd(  @cmd, 1 ) if( $job{'_doneDates'}->val('doneDates','monthly') ne $thisMonth and $job{'monthlyKeep'}>0 );
+	$cmd[3]='weekly';
+	ExecCmd(  @cmd, 1 ) if( $job{'_doneDates'}->val('doneDates','weekly') ne $thisWeek and $job{'weeklyKeep'}>0 );
+	$cmd[3]='daily';
+	ExecCmd(  @cmd, 1 ) if( $job{'_doneDates'}->val('doneDates','daily') ne $thisDay and $job{'dailyKeep'}>0 );
+	}
+
+### hier geht's wirklich los ###
+execPreJobCommand($jobname);
+
+################################################################################################################################
+###############debut des modifs
+installWatchdog($opts{'watchdog'}||0);
+
+if ($job{'SMEServer'} ne 'no')
+	{
+	my $prebackup='SME/signal-pre-backup';
+	if ($job{'remoteHostName'} eq 'localhost')
+		{
+		execJobCommand($jobname,$prebackup);
+		}
+	else
+		{
+		execJobCommandRemote($jobname,$prebackup);
+		}	
+	}
+
+installedRPMsList(0) if  $job{'SMEServer'} ne 'no' and $job{'remoteHostName'} ne 'localhost';
+############### ligne ci-dessus: suppression de "!$ESX and " entre if et $job
+##### fin modifs
+################################################################################################################################
+
+
+
+my $linkDest='';
+if( $Command eq 'scheduled' )
+	{
+	my $exclude = getExcludedString();
+	my $include = getIncludedString();
+	$linkDest = getLinkdest($jobname,0);
+	dbg( "Using link destination $linkDest" ) if $linkDest;
+	my @cmd;
+	my $status=0;;
+	my $rsyncOutput='';
+
+	File::Path::mkpath( "$job{'RootDir'}/$jobname/scheduled.running", 0, 0700 ) 
+		unless -d "$job{'RootDir'}/$jobname/scheduled.running";
+	if( $job{'_rsyncd'} ) # e.g. Windows Server with rsyncd installed
+		{
+		my @SourceDirs=getSourceDirs($jobname);
+		my $source='';
+		foreach my $src (@SourceDirs)
+			{
+			$src = "/$src" if not $src =~ /^\//;
+			$src =~ s/'/'\\''/g; # escape single quotes
+			$source .= ($job{'rsyncdUser'} ? $job{'rsyncdUser'}.'@' : '') . $job{'remoteHostName'} . "::'" . $job{'rsyncdModule'} . $src . "' ";
+			}
+		@cmd=(
+			$job{'_rsyncLocal'},
+			"--archive",
+			"--hard-links",
+			"--stats",
+			"--delete-during", 
+			"--ignore-errors", 
+			"--delete-excluded",
+			"--relative",
+			"--partial",
+			$job{'BandwidthLimit'} ? "--bwlimit=$job{'BandwidthLimit'}" : '',
+			$job{'rsync--modify-window'} > 0 ? "--modify-window=$job{'rsync--modify-window'}" : '',
+			$job{'rsync--inplace'} ne 'no' ? "--inplace" : "",
+			$job{'rsyncTimeout'} ? "--timeout=$job{'rsyncTimeout'}" : "",
+			$job{'rsyncCompress'} eq 'yes' ? "--compress" : "",
+			"--numeric-ids",
+			( $linkDest ? "--link-dest='$job{'RootDir'}/$jobname/$linkDest'" : '' ),
+			$include, 
+			$exclude, 
+			$job{'rsyncOptions'},
+			$source,
+			"$job{'RootDir'}/$jobname/scheduled.running/" 
+			);
+		$status=ExecCmd(  @cmd, 0 );
+		$rsyncOutput=$ExecCmdOutout;
+		}
+	else # Standard Linux 
+		{
+		my $SourceDirs = getSourceDirsString($jobname)||'/';
+
+########################################################################################################################################
+################### debut des modifs: ajout du "if........." dito V2
+		$SourceDirs =~ s/'/'\\''/g if $job{'remoteHostName'} ne 'localhost' ; # escape single quotes
+################## fin des mofifs
+#######################################################################################################################################
+
+		@cmd=(
+			$job{'_rsyncLocal'},
+			"--archive",
+			"--hard-links",
+			"--stats",
+			"--delete-during", 
+			"--ignore-errors", 
+			"--delete-excluded",
+			"--relative",
+			"--partial",
+			$job{'BandwidthLimit'} ? "--bwlimit=$job{'BandwidthLimit'}" : '',
+			$job{'rsync--modify-window'} > 0 ? "--modify-window=$job{'rsync--modify-window'}" : '',
+			$job{'rsync--inplace'} ne 'no' ? "--inplace" : "",
+			$job{'rsyncTimeout'} ? "--timeout=$job{'rsyncTimeout'}" : "",
+			$job{'rsyncCompress'} eq 'yes' ? "--compress" : "",
+			"--numeric-ids",
+			"--rsync-path=\"$job{'_rsyncRemote'}\"",
+			"--rsh=\"$job{'localSSHBinary'} $job{'_sshOpts'}\"",
+			( $linkDest ? "--link-dest='$job{'RootDir'}/$jobname/$linkDest'" : '' ),
+			$include, 
+			$exclude, 
+			$job{'rsyncOptions'},
+			$job{'remoteHostName'} eq 'localhost' ? "$SourceDirs" : $job{'remoteUser'}.'@'.$job{'remoteHostName'}.":'$SourceDirs'",
+			"$job{'RootDir'}/$jobname/scheduled.running/" 
+			);
+#######################################################################################################################################
+####################### debut des modifs faites dans le bas de la commande @cmd prÃecedente
+#
+#
+#                      	$job{'remoteHostName'} eq 'localhost' ? "$SourceDirs" : $job{'remoteUser'}.'@'.$job{'remoteHostName'}.":'$SourceDirs'",
+#
+######################### fin des modifs
+##########################################################################################################################################
+
+		lg( "Running rsync..." );
+		$status=ExecCmd(  @cmd, 0 );
+		$rsyncOutput=$ExecCmdOutout;
+		}
+	# if nothing was transferred, scheduled.running does not exist
+	if( not -d "$job{'RootDir'}/$jobname/scheduled.running" )
+		{
+		lg( "Error: No data transferred. Check include/exclude settings." );
+		$status+=1000;
+		}
+
+	if( $status eq '0' or $status  eq  '23' or $status  eq  '24' )
+		{
+		# write report file
+		my $reportfile="$job{'RootDir'}/$jobname/scheduled.running/.AFFA3-REPORT";
+		lg( "writing $reportfile");
+		my $rpt=Config::IniFiles->new();
+		(my $used, my $avail) = df( $job{'RootDir'} );
+		$rpt->AddSection('Report');
+		$rpt->newval('Report','Date',Date::Format::time2str("%Y%m%d%H%M",time()));
+		$rpt->newval('Report','ExecutionTime',time()-$StartTime);
+		foreach my $s (split(/[\r\n]/,$rsyncOutput)) {
+			next if( $s=~/(^rsync)|(^sent)|(^total size is)|(^File list)/ );
+			my @p = split(/:/, $s);
+			(my $key=$p[0])=~s/\b(\w)/\U$1/g; # first char uppercase
+			$key=~s/ //g;
+			(my $val=trim($p[1]))=~s/ .*$//;
+
+######################################################### ajout AG pour enlever les virgules générées par rsync3
+			$val=~ s/,//g;
+######################################################### fin des modifs AG
+
+			$rpt->newval('Report',$key,$val);
+		}
+		$rpt->newval('Report','RootDirFilesystemUsed',$used); # kbytes
+		$rpt->newval('Report','RootDirFilesystemAvail',$avail); # kbytes
+		$rpt->newval('Report','RootDirFilesystemUsage',sprintf('%.1f',$used/($avail+$used)*100)); # percent
+		$rpt->newval('Report','ExitStatus',$status);
+		$rpt->newval('Report','Dedup',$job{"dedup"} ne 'yes' || not $linkDest ? 'no':'yes');
+		$rpt->WriteConfig($reportfile);
+
+		# save used setup
+		my $usfile="$job{'RootDir'}/$jobname/scheduled.running/.$jobname-setup.ini";
+		my $js=open( JS, ">$usfile" ) or lg( "Error: Couldn't write $usfile" );
+		if( $js ) {
+			print JS "[$jobname]\n";
+			print JS "; Created on " . trim(Date::Format::ctime(time())) . "\n";
+			foreach my $key (sort { lc($a) cmp lc($b) } keys %job) {
+				next if $key=~/^_/;
+				if( ref $job{$key} eq 'ARRAY' ) {
+					foreach my $r (sort @{$job{$key}} ) {
+						print JS "$key=$r\n";
+					}
+				} else {
+					print JS "$key=$job{$key}\n" if $job{$key};
+				}
+			}
+			close(JS);
+		}
+######################################################################################################################
+############################# ajout de modifs
+		compareRPMLists("$job{'RootDir'}/$jobname/scheduled.running");
+############################# fin ajout modifs
+######################################################################################################################
+
+	} else
+		{
+		affaErrorExit( "rsync failed with status $status.");
+		}
+	}
+shiftArchives();
+if( $Command ne 'scheduled' ) {
+	my %dd=('daily'=>$thisDay,'weekly'=>$thisWeek,'monthly'=>$thisMonth,'yearly'=>$thisYear);
+	$job{'_doneDates'}->setval('doneDates',$Command, $dd{$Command});
+	$job{'_doneDates'}->RewriteConfig();
+}
+execPostJobCommand($jobname);
+
+
+################################################################################################################################
+###############debut des modifs
+
+
+if ($job{'SMEServer'} ne 'no')
+	{
+	my $postbackup='SME/signal-post-backup';
+	if ($job{'remoteHostName'} eq 'localhost')
+		{
+		execJobCommand($jobname,$postbackup);
+		}
+	else
+		{
+		execJobCommandRemote($jobname,$postbackup);
+		}
+	}
+
+##############fin des modifs
+################################################################################################################################
+
+
+
+
+
+
+
+deduplicate($jobname);
+DiskSpaceWarn();
+sendSuccessMesssage();
+affaExit( "Completed job '$jobname $Command ($job{'remoteHostName'})'" );
+
+exit 0; 
+
+############################################################################
+
+sub getDefaultConfig() {
+	my %job=(
+		'AutomountDevice'=>'',
+		'AutomountOptions'=>'',
+		'AutomountPoint'=>'',
+		'AutoUnmount'=>'',
+		'BandwidthLimit'=>0,
+		'chattyOnSuccess'=>0,
+		'ConnectionCheckTimeout'=>120,
+		'dailyKeep'=>7,
+		'Debug'=>'no',
+		'dedup'=>'no',
+		'dedupKill'=>'no',
+		'Description'=>'',
+		'DiskSpaceWarn'=>'strict', # strict | normal | risky | none
+		'_doneDates'=>0,
+		'EmailAddress'=>['root'], # multivalue
+		'Exclude'=>[], # multivalue
+		'Include'=>[], # multivalue
+		'killAt'=>'',
+		'localNice'=>0,
+		'localNiceBinary'=>'nice',
+		'localRsyncBinary'=>'rsync',
+		'localSSHBinary'=>'ssh',
+		'_lockfile'=>'',
+		'_LockIsSet'=>0,
+		'monthlyKeep'=>12,
+		'NRPEtrigger'=>24,
+		'postJobCommand'=>[],
+		'postJobCommandRemote'=>[],
+		'preJobCommand'=>[],
+		'preJobCommandRemote'=>[],
+		'RemoteAuthorizedKeysFile'=>'.ssh/authorized_keys2', # relative to remoteUser Homedir
+		'remoteHostName'=>'',
+		'remoteNice'=>0,
+		'remoteNiceBinary'=>'/bin/nice',
+		'remoteRsyncBinary'=>'/usr/bin/rsync',
+		'remoteUser'=>'root',
+		'resumeKilledAt'=>'',
+		'resumeAfterBoot'=>'yes',
+		'RetryAfter'=>600,
+		'RetryAttempts'=>4,
+		'RetryNotification'=>'yes',
+		'RootDir'=>'/var/affa',
+		'rsyncCompress'=>'yes',
+		'_rsyncd'=>0,
+		'rsyncdMode'=>'no',
+		'rsyncdModule'=>'AFFA',
+		'rsyncdPassword'=>'',
+		'rsyncdUser'=>'affa',
+		'rsync--inplace'=>'yes',
+		'_rsyncLocal'=>'/usr/bin/rsync',
+		'rsync--modify-window'=>0,
+		'rsyncOptions'=>'',
+		'_rsyncRemote'=>'/usr/bin/rsync',
+		'rsyncTimeout'=>900,
+		'SambaShare'=>'no',
+		'SambaValidUser'=>['affa'], # multivalue
+		'scheduledKeep'=>1,
+		'_sshOpts'=>'',
+		'sshPort'=>22,
+		'status'=>'enabled',
+		'TimeSchedule'=>['2230'], # multivalue
+		'weeklyKeep'=>4,
+		'yearlyKeep'=>2,
+		'SMEServer'=>'no',
+		'RPMCheck'=>'no',
+		'Watchdog'=>'no',
+		);
+############################################################################################
+#####   ajoute 'SMEServer'=>'no',	3 lignes plus haut
+#####	ajoute 'RPMCheck'=>'no',	3 lignes plus haut
+#####	ajoute 'Watchdog'=>'no',	3 lignes plus haut
+############################################################################################
+
+	return %job;
+}
+
+sub getMultivalueKeys() {
+	my %multi=(
+		'EmailAddress'=>'string',
+		'Exclude'=>'yes',
+		'Include'=>'yes',
+		'SambaValidUser'=>'string',
+		'TimeSchedule'=>'yes',
+		'preJobCommand'=>'yes',
+		'preJobCommandRemote'=>'yes',
+		'postJobCommand'=>'yes',
+		'postJobCommandRemote'=>'yes',
+	);
+	return %multi;
+}
+
+sub showDefaults() {
+	%job=getJobConfig('');
+	foreach my $key (sort { lc($a) cmp lc($b) } keys %job) {
+		next if $key=~/^_/;
+		if( ref $job{$key} eq 'ARRAY' ) {
+			foreach my $r (sort @{$job{$key}} ) {
+				print "$key=$r\n";
+			}
+		} else {
+			print "$key=$job{$key}\n";
+		}
+	}
+}
+
+sub getJobConfig( $ ) {
+	my $jobname = shift||'';
+	my %job=getDefaultConfig();
+
+	if( not -f $configfile ) {
+		my @cfgfiles=getConfigFileList();  # only valid ones
+		my @cmd=('echo','-n','>',$configfile,';','chmod','400',$configfile,';','cat');
+		foreach my $s (@cfgfiles) {
+			push(@cmd, $s);
+		}
+		push(@cmd,'>');
+		push(@cmd, $configfile);
+		ExecCmd( @cmd, 0 );
+		$cfg = Config::IniFiles->new( -file => $configfile, -default => 'GlobalAffaConfig', -nocase => 0);
+	}
+
+	my %multi=getMultivalueKeys();
+
+	# configured global Defaults 
+	my @p=$cfg->Parameters('GlobalAffaConfig');
+	foreach my $k (@p) {
+		if( $multi{$k} ) {
+			my @m=$cfg->val($jobname,$k);
+			$job{$k}=[@m];
+			$job{"_$k"}=join(',',@m) if $multi{$k} eq 'string';
+		} else {
+			$job{$k}=$cfg->val($jobname,$k);
+		}
+	}
+	# configured Job
+	@p=$cfg->Parameters($jobname);
+	foreach my $k (@p) {
+		if( not defined $job{$k} ) {
+			my @val=$cfg->val($jobname,$k);
+			my $txt="Unknown parameter '$k=$val[0]' in configuration of job '$jobname'";
+			print "$txt\n";
+			affaExit($txt);
+		}
+		if( $multi{$k} ) {
+			my @m=$cfg->val($jobname,$k);
+			$job{$k}=[@m];
+			$job{"_$k"}=join(',',@m) if $multi{$k} eq 'string';
+		} else {
+			$job{$k}=$cfg->val($jobname,$k);
+			lg( "*** Error in job config $jobname: Multivalues are not allowed for key $k") if $job{$k}=~/\n/;
+			$job{$k}=~s/\n.*//;
+		}
+	}
+
+	# globalStatus overides job status
+	$job{'status'}=$job{'globalStatus'} if( ($job{'globalStatus'}||'') =~ /^(enabled|disabled)$/ );
+
+	# check and set save keep settings if needed
+	$job{'scheduledKeep'}=1 if( $job{'scheduledKeep'}<1 );
+	$job{'dailyKeep'}=0 if( $job{'dailyKeep'}<0 );
+	$job{'weeklyKeep'}=0 if( $job{'weeklyKeep'}<0 );
+	$job{'monthlyKeep'}=0 if( $job{'monthlyKeep'}<0 );
+	$job{'yearlyKeep'}=0 if( $job{'yearlyKeep'}<0 );
+
+	$job{'_rsyncLocal'} = $job{'localRsyncBinary'};
+	$job{'_rsyncLocal'} = "$job{'localNiceBinary'} --adjustment=$job{'localNice'} $job{'localRsyncBinary'}" if $job{'localNice'};
+	$job{'_rsyncRemote'} = $job{'remoteRsyncBinary'};
+	$job{'_rsyncRemote'} = "$job{'remoteNiceBinary'} --adjustment=$job{'remoteNice'} $job{'remoteRsyncBinary'}" if $job{'remoteNice'};
+	$job{'_rsyncd'} = $job{'rsyncdMode'} eq 'yes' ? 1 : 0;
+	$ENV{'RSYNC_PASSWORD'}=$job{'rsyncdPassword'};
+	$job{'rsyncdPassword'}=$job{'rsyncdPassword'} ? '<not shown>' : '';
+	$job{'Debug'}='yes' if $opts{'debug'};
+###############################################################################################################################################
+############################## ajout modifs
+	$sshQuiet = $job{'Debug'} eq 'yes' ? '' : '-q';
+############################# fin modifs
+#############################################################################################################################################
+	# get Done Dates
+	if( $jobname ) {
+		$job{'_sshOpts'}="-p $job{'sshPort'} -o CheckHostIP=no -o StrictHostKeyChecking=no -o HostKeyAlias=$jobname -o UserKnownHostsFile=/root/.ssh/knownhosts-$jobname" . ($job{'Debug'} ne 'yes' ? ' -q' : '');
+		$job{'_lockfile'} = "$lockdir/$jobname";
+	}
+	return %job;
+}
+
+sub checkConfig() {
+	my $errcnt=0;
+	my $casecnt=0;
+	my %multi=getMultivalueKeys();
+	my %defaults=getDefaultConfig();
+	my %defaults_lc = map { lc $_ => $_ } keys %defaults;
+	foreach my $k (keys %defaults) {
+		$defaults_lc{lc $k}=$k;	
+	}
+	my @cfiles=getConfigFileList();
+	foreach my $f (@cfiles) {
+		my $cfg = Config::IniFiles->new( -file => $f, -nocase => 0);
+		foreach my $s ($cfg->Sections()) {
+			$s =~ /([a-z0-9_\.-]*)/i;
+			print "Checking job section $s ($f)\n";
+			if( $s ne $1 ) {
+				print "*** ERROR: Illegal characters in job name\n";
+				$errcnt++;
+			}
+			my @parms=$cfg->Parameters($s);
+			foreach my $p (@parms) {
+				my @v=$cfg->val($s,$p);
+				my $val=$v[0];
+				if( $p =~ /(sendStatus|globalStatus)/ ) {
+					if( $s ne 'GlobalAffaConfig' ) {
+						print "*** ERROR: Key $p only allowed in GlobalAffaConfig section\n";
+						$errcnt++;
+					} elsif( $p eq 'globalStatus' and not $val =~ /(enabled|disabled|jobs)/ ) {
+						print "*** ERROR: Bad value: $p=$val\n";
+						$errcnt++;
+					} elsif( $p eq 'sendStatus' and not $val =~ /(daily|weekly|monthly|never)/ ) {
+						print "*** ERROR: Bad value: $p=$val\n";
+						$errcnt++;
+					}
+					next;
+				}
+				if( $p=~/^_/ or not defined $defaults{$p} and not defined $defaults_lc{lc $p} ) {
+					print "*** ERROR: Unknown key: $p\n";
+					$errcnt++;
+					next;
+				}
+				if( not defined $defaults{$p} and defined $defaults_lc{lc $p} ) {
+					my $err=renameConfigKey($s,$p,$defaults_lc{lc $p});
+					print "*** CASE ERROR: $p -> $defaults_lc{lc $p} FIXED.\n";
+					$p=$defaults_lc{lc $p};
+					$casecnt++;
+				}
+				if( scalar @v > 1 and not $multi{$p} ) {
+					print "*** ERROR: Multivalues are not allowed for key $p\n";
+					$errcnt++;
+					next;
+				}
+				if( $p eq 'killAt' or  $p eq 'resumeKilledAt') {
+					if( not $val=~/^\d\d\d\d$/ or $val>2359) {
+						print "*** ERROR: Bad value: $p=$val\n";
+						$errcnt++;
+					}
+				}
+				if( $p eq 'TimeSchedule' ) {
+					foreach my $t (@v) {
+						if( not $t=~/^\d\d\d\d$/ or $t>2359) {
+							print "*** ERROR: Bad value: $p=$t\n";
+							$errcnt++;
+						}
+					}
+				}
+				if( $p eq 'RootDir' ) {
+					if( not -d $val ) {
+						print "*** ERROR: Directory does not exist: $p=$val\n";
+						$errcnt++;
+					}
+				}
+				if( $p eq 'DiskSpaceWarn' ) {
+					if( not $val=~/^(strict|normal|risky|none)$/ ) {
+						print "*** ERROR: Bad value: $p=$val\n";
+						$errcnt++;
+					}
+				}
+				if( $p =~ /JobCommand/ ) {
+					foreach my $s (@v) {
+						if( not -x "/etc/affa/scripts/$s" ) {
+							print "*** ERROR: No executable script found: $p=$s\n";
+							$errcnt++;
+						}
+					}
+				}
+			}
+			$cfg = Config::IniFiles->new( -file => $f, -nocase => 0) if $casecnt;
+			if( $s ne 'GlobalAffaConfig' ) {
+				if( not $cfg->val($s,'remoteHostName') ) {
+					print "*** ERROR: Key remoteHostName is mandatory\n";
+					$errcnt++;
+					next;
+				}
+			}
+		}
+	}
+	if( not $errcnt and not $casecnt ) {
+		print "Configuration  is ok.\n";
+	} else {
+		print $casecnt ? "Fixed $casecnt case errors\n" : '';
+		print $errcnt ? "Configuration has $errcnt errors\n" : '';
+	}
+}
+
+sub getJobs() {
+	my @joblist;
+	foreach my $job ($cfg->Sections()) {
+		next if $job eq 'GlobalAffaConfig';
+		push( @joblist, $job);
+	}
+	return @joblist;
+}
+
+sub getConfigFileList() {
+	dbg('Fetching list of all config files');
+	my @cmd=('find','/etc/affa/','-type','f','-name','"*.conf"');
+	ExecCmd( @cmd, 0 );
+	my @ret=();
+	my @list = split(/[\r\n]/, $ExecCmdOutout);
+	foreach my $s (@list) {
+		my $c=Config::IniFiles->new( -file => $s);
+		if( not $c ) {
+			foreach my $e (@Config::IniFiles::errors) {
+				$e=~s/[\r\n][\t ]*/ /g;
+				my $txt="CONFIG ERROR: $e";
+				print "$txt\n";
+				lg( $txt );
+			}
+			my $txt="CONFIG ERROR: File '$s' ignored!";
+			print "$txt\n";
+			lg( $txt );
+		} else {
+			push( @ret, $s);
+		}
+	}
+	return sort @ret;
+}
+
+sub rewriteConfigVal($$$) {
+	(my $jobname, my $key, my $newval)=@_;
+	my $err=1;
+	my $c=openOrgConfig($jobname);
+	if( $c ) {
+		$c->setval($jobname,$key,$newval);
+		writeConfigFile($c);
+		$err=0;
+	}
+	return $err;
+}
+
+sub renameConfigKey($$$) {
+	(my $jobname, my $oldkey,my $newkey)=@_;
+	my $err=1;
+	my $c=openOrgConfig($jobname);
+	if( $c ) {
+		my @val=$c->val($jobname,$oldkey);
+		$c->delval($jobname,$oldkey);
+		my @nv=$c->val($jobname,$newkey);
+		if( scalar @nv ) {
+			push(@val,@nv);
+		}
+		$c->newval($jobname, $newkey, @val);
+		writeConfigFile($c);
+		$err=0;
+	}
+	return $err;
+}
+
+sub openOrgConfig($) {
+	my $jobname=shift;
+	my $cfg;
+	my @list=getConfigFileList();
+	foreach my $s (@list) {
+		$cfg=Config::IniFiles->new( -file => $s);
+		if( $cfg->SectionExists($jobname) ) {
+			last;
+		}
+		undef $cfg;
+	}
+	return $cfg;
+}
+
+
+sub setLock() {
+	open( LOCK, ">$job{'_lockfile'}" ) or die "Error: Couldn't create lockfile $job{'_lockfile'}\n";
+	print LOCK "$process_id\n";
+	close( LOCK ) or warn "Error: Couldn't close lockfile $job{'_lockfile'}\n";;
+	$job{'_LockIsSet'}=1;
+}
+
+sub removeLock() {
+	unlink( $job{'_lockfile'} ) if( -f $job{'_lockfile'} && $job{'_LockIsSet'} );
+	$job{'_LockIsSet'}=0;
+}
+
+sub getLock($) {
+	my $jobname=shift;
+	%job=getJobConfig($jobname);
+	my $lockpid=0;
+	if( open( LOCK, "<$job{'_lockfile'}" ) ) {
+		$lockpid=<LOCK>;
+		chomp( $lockpid );
+		close( LOCK );
+	}
+	if( $lockpid ) {
+		if( -f "/proc/$lockpid/stat" ) {
+			if( open( STAT, "</proc/$lockpid/stat" ) ) {
+				my $stat=<STAT>;
+				chomp( $stat );
+				close( STAT );
+				if( not ($stat =~ /^$lockpid \(affa\)/) ) {
+					$lockpid=0;
+					unlink $job{'_lockfile'};
+					lg( "Orphaned lock found and removed." );
+				}
+			}
+		} else { 
+			$lockpid=0; 
+			unlink $job{'_lockfile'};
+			lg( "Orphaned lock found and removed." );
+		}
+	}
+	return $lockpid;
+}
+
+# returns process id if dedup is running
+sub findProcessId($$) {
+	(my $treepid, my $pattern)=@_;
+	my %pt;
+	my $ret='';
+	getChildProcess($treepid, \%pt); 
+	foreach my $p (keys %pt) {
+		if( $pt{$p} =~ /$pattern/ ) {
+			$ret=$p;
+			last;
+		}
+	}
+	return $ret;
+}
+
+sub getChildProcess($$) {
+	(my $parent, my $pt)=@_;
+	my $proc_table=Proc::ProcessTable->new();
+	foreach my $proc (@{$proc_table->table()}) {
+		if ($proc->ppid == $parent) {
+			my $cmd='';
+			if( open( CMD, "</proc/".$proc->pid."/cmdline" ) ) {
+				$cmd=<CMD>||''; close(CMD);
+				$cmd=~s/\0/ /g;
+			}
+  			$pt->{$proc->pid}=$cmd;
+			getChildProcess($proc->pid,$pt);
+		}
+  	}
+	return $pt;
+}
+
+sub getProcessState($) {
+	my $jobname=shift;
+	my $lockpid=getLock($jobname);
+	my $state='';
+	if( $lockpid ) {
+		my $job=getJobConfig($jobname);
+		if( findProcessId($lockpid,"$job{'localRsyncBinary'}.*scheduled.running" )) {
+			$state="running rsync";
+		} elsif( findProcessId($lockpid, $dedupBinary) ) {
+			$state="deduplicating";
+		} else {
+			$state = 'waiting';
+		}
+	} else {
+		my $job=getJobConfig($jobname);
+		my $rptfile=$job{'RootDir'}."/$jobname/scheduled.0/.AFFA3-REPORT";
+		if( -d "$job{'RootDir'}/$jobname/scheduled.running" ) {
+			$state='rsync interrupted' 
+		} elsif( -f $rptfile ) {
+			my $rpt = Config::IniFiles->new( -file => $rptfile );
+			if( $rpt->exists('Report','Dedup') && $rpt->val('Report','Dedup') eq 'yes' && ! $rpt->exists('Report','DedupDate')) {
+				$state='dedup interrupted' 
+			}
+		}
+	}
+	return $state;
+}
+
+sub checkConnection($) {
+	my $jobname=shift;
+	return checkConnection_silent($jobname,0,0);
+}
+
+sub checkConnection_silent($$$) {
+
+######################################################################################################################################################
+############### debut modifs
+	return 0 if ($job{'remoteHostName'} eq 'localhost');
+
+############## fin modifs
+#########################################################################################################################################################
+
+	my ($jobname,$viapi,$silent)=@_;
+	my %job=getJobConfig($jobname);
+	my $status=0;
+	my @cmd;
+	if( $job{'_rsyncd'} ) {
+		lg( "Checking rsyncd connection to " . $job{'remoteHostName'} );
+		@cmd=($job{'_rsyncLocal'}, '-dq', ($job{'rsyncdUser'} ? $job{'rsyncdUser'}.'@' : '') . $job{'remoteHostName'} . "::'" . $job{'rsyncdModule'} . "'");
+		not ExecCmd( @cmd, 0 ) or affaErrorExit( "Rsyncd connection to ". $job{'remoteHostName'}. " failed. Did you set the rsyncdUser, rsyncdPassword and rsyncdModule properties correctly?" );
+	} else {
+		lg( "Checking SSH connection to " . $job{'remoteUser'}.'@'.$job{'remoteHostName'} );
+		@cmd=('/usr/bin/ssh', '-o', "ConnectTimeout=$job{'ConnectionCheckTimeout'}",'-o','PasswordAuthentication=no', $job{'_sshOpts'}, $job{'remoteUser'}.'@'.$job{'remoteHostName'},'echo OK');
+		ExecCmd( @cmd,0); chomp($ExecCmdOutout);
+		if( $ExecCmdOutout ne "OK" ) {
+			$status=-1;
+			if( !$silent ) {
+				affaErrorExit( "SSH connection to ". $job{'remoteHostName'}. " failed. Did you send the public key?" );
+			}
+		}
+	}
+	return $status;
+}
+
+
+###################################################################################################################################################################################################
+######################################## début ajout modifs
+sub installedRPMsList($)
+	{
+	return if $job{'SMEServer'} eq 'no' or $job{'RPMCheck'} ne 'yes';
+	my $forceLocal=shift(@_);
+	# requires bash shell on remote host
+	my @cmd;
+	if( $job{'remoteHostName'} eq 'localhost' or $forceLocal )
+		{
+		lg( "writing list of installed RPMs on localhost ($rpmlist)" );
+		@cmd=( "/sbin/e-smith/affa-rpmlist.sh", ">$rpmlist" );
+		}
+	else
+		{
+		lg( "writing list of installed RPMs on ". $job{'remoteHostName'} . " ($rpmlist)");
+
+
+############################################################################### ligne suivante: rajouté $jobname
+		remoteCopy($jobname, "/sbin/e-smith/affa-rpmlist.sh", "/sbin/e-smith/affa-rpmlist.sh");
+		@cmd=(
+			'/usr/bin/ssh',
+			'-o', "HostKeyAlias=$jobname",
+			'-p', $job{'sshPort'},
+			$sshQuiet, 
+			$job{'remoteHostName'},
+			"'/sbin/e-smith/affa-rpmlist.sh>$rpmlist'"
+			);
+		}
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "writing list of installed RPMs failed." );
+	}
+
+
+sub compareRPMLists($)
+	{
+	return if $job{'SMEServer'} eq 'no' or $job{'remoteHostName'} eq 'localhost' or $job{'RPMCheck'} ne 'yes';
+	my $localRPMList=shift;
+	lg( "Comparing installed RPMs on backup und remote host" );
+	my $RPMPath="home/e-smith/db/affa-rpmlist";
+	my %remoteRPM;
+	dbg( "Reading remote RPM list" );
+	open( RP, "$localRPMList/$RPMPath" ) or affaErrorExit( "Couldn't open $localRPMList/$RPMPath" );
+	while( <RP> )
+		{
+		my @z = split( " ", $_);
+		$remoteRPM{$z[0]}=$z[1];
+		}
+	close( RP );
+	installedRPMsList(1);
+	my %localRPM;
+	dbg( "Reading local RPM list" );
+	open( RP, "</$RPMPath" ) or lg( "Error: Couldn't open /$RPMPath" );
+	while( <RP> )
+		{
+		my @z = split( " ", $_);
+		$localRPM{$z[0]}=$z[1];
+		}
+	close( RP );
+	# vergleichen
+	my (@missing, @VersionMismatch);
+	my $md5 = Digest::MD5->new;
+	foreach my $p ( keys %remoteRPM ) 
+		{
+		if( not $localRPM{$p} )
+			{
+			push( @missing, "$p-".$remoteRPM{$p});
+			$md5->add("$p-".$remoteRPM{$p});
+			}
+		elsif( $localRPM{$p} ne $remoteRPM{$p} )
+			{
+			push( @VersionMismatch, "$p-".$remoteRPM{$p});
+			$md5->add("$p-".$remoteRPM{$p});
+			}
+		}
+	my $RPMFilename="$job{'RootDir'}/$jobname/rpms-missing.txt";
+	my $MD5Filename="$job{'RootDir'}/$jobname/.md5-rpms-missing-".$md5->hexdigest;
+	dbg("RPMFilename=$RPMFilename");
+	dbg("MD5Filename=$MD5Filename");
+	if( not -f $MD5Filename )
+		{
+		open( RP, ">$RPMFilename" ) or affaErrorExit( "Couldn't open $RPMFilename for writing.");
+
+		my $out='';
+		foreach my $k (@missing)
+			{
+			$out .= "$k\n";
+			}
+		if( $out )
+			{
+			print RP "* \n";
+			print RP "* The following packages are installed on ".$job{'remoteHostName'}.",\n";
+			print RP "* but they are missing on this backup host:\n";
+			print RP "* \n";
+			print RP $out;
+			}
+
+		$out='';
+		foreach my $k (@VersionMismatch)
+			{
+			$out .= "$k\n";
+			}
+		if( $out )
+			{
+			print RP "\n* \n";
+			print RP "* The following packages are installed on both,\n";
+			print RP "* the source ".$job{'remoteHostName'}." and on this backup host,\n";
+			print RP "* but the version does not match:\n";
+			print RP "* \n";
+			print RP $out;
+			}
+
+		close( RP );
+
+		if( $job{'RPMCheck'} eq 'yes' and not -f $MD5Filename and $job{'_EmailAddress'} )
+			{
+			my $msg = new Mail::Send;
+			$msg->subject("Missing RPMs on $SystemName.$DomainName ($LocalIP) compared with ". $job{'remoteHostName'});
+			$msg->to($job{'_EmailAddress'});
+			$msg->set("From", "\"Affa Backup Server\" <noreply\@$SystemName.$DomainName>");
+			my $fh = $msg->open;
+			open( RP, "<$RPMFilename" ) or affaErrorExit( "Couldn't open $RPMFilename.");
+############################################################ attention dans AffaV2, c'est $job{'EmailAdresses'} donc modifié aussi dans la déclaration des variables et paramètres
+			while( <RP> )
+				{
+				print $fh $_;
+				}
+			close( RP );
+			$fh->close; 
+			lg( "RPM check message sent to " . $job{'_EmailAddress'} );
+			}
+
+		unlink( glob( "$job{'RootDir'}/$jobname/.md5-rpms-missing-*" ) );
+		open( RP, ">$MD5Filename" ) or affaErrorExit( "Couldn't open $MD5Filename for writing.");
+		print RP "md5sum of content of file $RPMFilename\n";
+		close( RP );
+		}
+	}
+
+########################################### fin ajout modifs
+#############################################################################################################################################################################################
+
+
+
+# get directories and files to backup from db
+# Add standard dirs if SME.
+sub getSourceDirs($) {
+	my $jobname=shift;
+	my %job=getJobConfig($jobname);
+	my @result=();
+
+##################################################################################################################################################################################################
+#######debut des modifs: recopie a partir de la version 2rc5
+
+        if( $job{'SMEServer'} ne 'no' )
+                {
+                my @SourceDirs=();
+		my $b = new esmith::Backup or die "Error: Couldn't create Backup object\n";
+                foreach my $k ($b->restore_list)
+                        {
+                        $k = "/$k" if not $k =~ /^\//;
+                        push( @SourceDirs, $k );
+                        }
+		push( @SourceDirs, "/etc/affa" );
+                
+## inutile si pas SMEServer=yes
+##      foreach my $k ( sort keys %job )
+##              {
+##              push( @SourceDirs, $job{$k} ) if $k =~ /^Include/;
+##              }
+
+
+
+		foreach my $k (@SourceDirs)
+			{
+			trim( $k );
+			next if not $k =~ /^\//;
+			$k =~ s/"/\\"/g;
+			push(@result, $k) if $k;
+			}
+##	return @result;
+		}
+
+############fin de la modif
+###############################################################################################################################################################################################
+
+
+
+	foreach my $k (@{$job{'Include'}}) {
+		trim( $k );
+		next if not $k =~ /^\//;
+		$k =~ s/"/\\"/g;
+		push(@result, $k) if $k;
+	}
+	return @result;
+}
+
+sub getSourceDirsString($) {
+	my $jobname=shift;
+	my @SourceDirs=getSourceDirs($jobname);
+	my $result='';
+	foreach my $k (@SourceDirs) {
+		next if not $k =~ /^\//;
+		$result .= '"' . $k . '" ';
+	}
+	return trim($result);
+}
+
+# get files to include 
+sub getIncludedString() {
+	my $result='';
+	foreach my $k (@{$job{'Include'}}) {
+		$k =~ s/"/\\"/g;
+		$result .= '--include="'.$k.'" ' if $k and not $k =~ /^\//;
+	}
+	chomp( $result );
+	return trim($result);
+}
+
+# get directories and files to exclude 
+sub getExcludedString() {
+	my $result='';
+	foreach my $k (@{$job{'Exclude'}}) {
+		$k =~ s/^\///;
+		$k =~ s/\/$//;
+		$k =~ s/"/\\"/g;
+		$result .= '--exclude="'.$k.'" ' if $k;
+	}
+	chomp( $result );
+	return trim($result);
+}
+
+sub getLinkdest($$) {
+	(my $jobname,my $prev)=@_;
+	my %job=getJobConfig($jobname);
+	my %timestamps;
+	my @st;
+	my $dir = opendir( DIR, "$job{'RootDir'}/$jobname" );
+	my $ar;
+	while( defined ($ar=readdir(DIR)) ) {
+		next if not $ar =~ /^(scheduled|daily|weekly|monthly|yearly)\.[0-9]+$/;
+		my $d=getReportVal($jobname, $ar);
+		 if( $d=~/^\d{12}$/ ) {
+		 	$timestamps{$ar}=$d;
+		 }
+	}
+	foreach my $k ( sort{$timestamps{$b} cmp $timestamps{$a}} keys %timestamps ) {
+		push(@st,$k);
+	}
+	return $prev ? ($st[1]||'') : ($st[0]||'');
+}
+
+sub shiftArchives() {
+	lg( "Shifting backup archives...");
+	my $nothingDone = "Nothing to be done.";
+	my $JobDir = "$job{'RootDir'}/$jobname";
+	my $basename = "$JobDir/$Command";
+	if( -d "$basename.0" and ( $Command ne 'scheduled' or -f "$JobDir/scheduled.running/.AFFA3-REPORT" ) ) {
+		my $keep = $job{$Command.'Keep'}-1;
+		if( -d "$basename.$keep" ) {
+			File::Path::mkpath( "$job{'RootDir'}/$jobname/.AFFA-TRASH", 0, 0700 ) unless -d "$job{'RootDir'}/$jobname/.AFFA-TRASH";
+			$nothingDone='';
+			moveFileorDir( "$basename.$keep", "$job{'RootDir'}/$jobname/.AFFA-TRASH/$Command.$keep-$curtime-$$" );
+		}
+		for( my $i=$keep; $i>0; $i-- ) {
+			if( -d "$basename." . ($i-1) ) {
+				$nothingDone='';
+				moveFileorDir( "$basename." . ($i-1), "$basename.$i");
+				chmod( 0700, "$basename.$i" );
+			}
+		}
+	}
+	if( $Command eq 'scheduled' and not -d "$JobDir/scheduled.0" and -f "$JobDir/scheduled.running/.AFFA3-REPORT" ) {
+		moveFileorDir( "$JobDir/scheduled.running", "$JobDir/scheduled.0" );
+		$nothingDone='';
+	}
+	if( $Command eq 'yearly' ) {
+		my $src = "$JobDir/monthly.".($job{'monthlyKeep'}-1);
+		$src = "$JobDir/weekly.".($job{'weeklyKeep'}-1) if (not -d $src) && !$job{'monthlyKeep'};
+		$src = "$JobDir/daily.".($job{'dailyKeep'}-1) if (not -d $src) && !$job{'monthlyKeep'} && !$job{'weeklyKeep'};
+		$src = "$JobDir/scheduled.".($job{'scheduledKeep'}-1) if (not -d $src) && !$job{'monthlyKeep'} && !$job{'weeklyKeep'} && !$job{'dailyKeep'};
+		if( -d $src ) {
+			moveFileorDir( $src, "$basename.0" );
+			chmod( 0700, "$basename.0" );
+			$nothingDone='';
+		}
+	} elsif( $Command eq 'monthly' ) {
+		my $src = "$JobDir/weekly.".($job{'weeklyKeep'}-1);
+		$src = "$JobDir/daily.".($job{'dailyKeep'}-1) if (not -d $src) && !$job{'weeklyKeep'};
+		$src = "$JobDir/scheduled.".($job{'scheduledKeep'}-1) if (not -d $src) && !$job{'weeklyKeep'} && !$job{'scheduledKeep'};
+		if( -d $src ) {
+			moveFileorDir( $src, "$basename.0" );
+			chmod( 0700, "$basename.0" );
+			$nothingDone='';
+		}
+	} elsif( $Command eq 'weekly' ) {
+		my $src = "$JobDir/daily.".($job{'dailyKeep'}-1);
+		$src = "$JobDir/scheduled.".($job{'scheduledKeep'}-1) if (not -d $src) && !$job{'dailyKeep'};
+		if( -d $src ) {
+			moveFileorDir( $src, "$basename.0" );
+			chmod( 0700, "$basename.0" );
+			$nothingDone='';
+		}
+	} elsif( $Command eq 'daily' and -d "$JobDir/scheduled.".($job{'scheduledKeep'}-1) ) {
+		moveFileorDir( "$JobDir/scheduled.".($job{'scheduledKeep'}-1), "$basename.0" );
+		chmod( 0700, "$basename.0" );
+		$nothingDone='';
+	}
+	removeDir( "$job{'RootDir'}/$jobname/.AFFA-TRASH",1 );
+	lg( $nothingDone ) if $nothingDone;
+}
+
+############################################################################################################################################
+########################## début des modifs: copié à partir de AffaV2
+
+sub installWatchdog($)
+	{
+	return if $job{'Watchdog'} ne 'yes' or $job{'SMEServer'} ne 'yes' or $job{'remoteHostName'} eq 'localhost';
+###################################  suppression de "$ESX or " entre le if et $job{'Watchdog'}
+
+	my $t=shift;
+	my $nextScheduled=($t||'86400')+600;
+	lg( "Installing watchdog on ".$job{'remoteHostName'} . " with dt=$nextScheduled seconds" );
+
+	my $scheduled=Date::Format::ctime(time()); chomp($scheduled);
+	my $WDName = "affa-watchdog-$jobname-$LocalIP";
+	my $trigger = Date::Format::time2str("%Y%m%d%H%M",time()+$nextScheduled);
+	open( WD, "</usr/lib/affa/watchdog.template" ) or warn "Error: Couldn't open /usr/lib/affa/watchdog.template\n";
+	open( WDS, ">/tmp/$$.$WDName" ) or warn "Error: Couldn't open /tmp/$$.$WDName for writing\n";
+	dbg( "Watchdog parameters:" );
+	while( <WD> )
+		{
+########################################################################################### modifs 3 lignes plus bas: dans AffaV2, c'est $job{'EmailAddresses'}
+		$_ =~ s/^use constant _TRIGGER=>.*$/use constant _TRIGGER=>$trigger;/;
+		$_ =~ s/^use constant _JOBNAME=>.*$/use constant _JOBNAME=>'$jobname';/;
+		$_ =~ s/^use constant _EMAIL=>.*$/use constant _EMAIL=>\'$job{'_EmailAddress'}\';/;
+		$_ =~ s/^use constant _BACKUPHOST=>.*$/use constant _BACKUPHOST=>'$SystemName.$DomainName ($LocalIP)';/;
+		$_ =~ s/^use constant _SCHEDULED=>.*$/use constant _SCHEDULED=>'$scheduled';/;
+		$_ =~ s/^use constant _WDSCRIPT=>.*$/use constant _WDSCRIPT=>'$WDName';/;
+		print WDS $_;
+		if( $_ =~ /^use constant/ )
+			{
+			(my $p = $_) =~ s/^use constant(.*);/$1/;
+			chomp($p);
+			dbg( "  " . trim($p) );
+			}
+		}
+	close( WDS );
+	close( WD );
+	chmod( 0700, "/tmp/$$.$WDName" );
+	my @cmd=('/usr/bin/ssh', '-o', "HostKeyAlias=$jobname", '-p', $job{'sshPort'}, $job{'remoteHostName'}, "/bin/rm", "-f", "/etc/cron.hourly/$WDName-reminder" ); 
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "Couldn't delete /etc/cron.hourly/$WDName-reminder on remote host." );
+####################################################################################### ligne suivante: ajouté $jobname
+	remoteCopy($jobname,"/tmp/$$.$WDName","/etc/cron.hourly/$WDName" );
+	unlink("/tmp/$$.$WDName");
+	}
+
+
+sub mailTestWatchdogRemote($)
+	{
+################################################################################################################################ ligne suivante ajoutée
+	my $jobname=shift;
+	my %job=getJobConfig( $jobname );	
+##################################################################################################################################
+	checkConnection($jobname);
+	my $WDName = "affa-watchdog-mailtest-$jobname-$LocalIP";
+	open( WD, "</usr/lib/affa/watchdog-mailtest.template" ) or warn "Error: Couldn't open /usr/lib/affa/watchdog.template\n";
+	open( WDS, ">/usr/lib/affa/$WDName" ) or warn "Error: Couldn't open /usr/lib/affa/$WDName for writing\n";
+	dbg( "Watchdog parameters:" );
+	while( <WD> )
+		{
+########################################################################################### modifs 2 lignes plus bas: dans AffaV2, c'est $job{'EmailAddresses'}
+		$_ =~ s/^use constant _JOBNAME=>.*$/use constant _JOBNAME=>'$jobname';/;
+		$_ =~ s/^use constant _EMAIL=>.*$/use constant _EMAIL=>\'$job{'_EmailAddress'}\';/;
+		$_ =~ s/^use constant _BACKUPHOST=>.*$/use constant _BACKUPHOST=>'$SystemName.$DomainName ($LocalIP)';/;
+		$_ =~ s/^use constant _WDSCRIPT=>.*$/use constant _WDSCRIPT=>'$WDName';/;
+		print WDS $_;
+		}
+	close( WDS );
+	close( WD );
+	chmod( 0700, "/usr/lib/affa/$WDName" );
+
+####################################################################################### ligne suivante: ajouté $jobname
+	remoteCopy($jobname, "/usr/lib/affa/$WDName", "/tmp/");
+	my @cmd=('/usr/bin/ssh', '-p', $job{'sshPort'}, '-o', "HostKeyAlias=$jobname", $sshQuiet, $job{'remoteHostName'},"/tmp/$WDName");
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "Couldn't run /usr/lib/affa/$WDName on remote host." );
+	}
+########################################################## fin des modifs
+#############################################################################################################################################
+
+sub execJobCommandRemote($$) {
+		(my $jobname, my $scrname)=@_;
+
+#############################################################################################################################################
+########################## début des modifs: en 'remoteHostName'=localhost, il n'y a pas de execJobCommandRemote --> renvoi vers execJobCommand
+
+
+	if ($job{'remoteHostName'} eq 'localhost')
+		{
+		execJobCommand($jobname,$scrname);
+		}
+
+	else
+		{
+
+##################### fin des modifs    ////// "}" rajouté à la fin de la fonction à cause du "else"
+
+		
+		my $script="$scriptdir/$scrname";
+		my $remoteScript="/tmp/affa-$jobname-$$-$curtime";
+		if( not -x $script ) {
+			my $txt= "Error: Script $scrname not found or not executable."; print("$txt\n");
+			affaErrorExit( "$txt" );
+		}
+		my %job=getJobConfig($jobname);
+		lg( "Executing script $scrname on $job{'remoteHostName'}");
+		my @cmd = (
+			$job{'_rsyncLocal'},
+			"--archive",
+			$job{'rsync--modify-window'} > 0 ? "--modify-window=$job{'rsync--modify-window'}" : '',
+			$job{'rsyncTimeout'} ? "--timeout=$job{'rsyncTimeout'}" : "",
+			$job{'rsyncCompress'} eq 'yes' ? "--compress" : "",
+			"--rsync-path=\"$job{'_rsyncRemote'}\"",
+			"--rsh=\"$job{'localSSHBinary'} $job{'_sshOpts'}\"",
+			$job{'rsyncOptions'},
+			$script,
+			($job{'remoteUser'} ? $job{'remoteUser'}.'@' : '') . $job{'remoteHostName'}.":$remoteScript",
+			);
+		not ExecCmd( @cmd, 0 ) or affaErrorExit( "Copying $remoteScript to $job{'remoteHostName'} failed." );
+		@cmd = (
+			"$job{'localSSHBinary'} $job{'_sshOpts'}",
+			($job{'remoteUser'} ? $job{'remoteUser'}.'@' : '') . $job{'remoteHostName'},
+			$remoteScript,
+			$job{'remoteHostName'}, 
+			$jobname, 
+		);
+		not ExecCmd( @cmd, 0 ) or affaErrorExit( "Executing script $scrname on $job{'RemoteHostName'} failed." );
+
+		}
+}
+
+
+sub execJobCommand($$) {
+	(my $jobname, my $scrname)=@_;
+	my $script="$scriptdir/$scrname";
+	if( not -x $script ) {
+		my $txt= "Error: Script $scrname not found or not executable."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig($jobname);
+	lg( "Executing script $scrname");
+	$allow_retry=0;
+	affaErrorExit( "Script '$script' not found or not executable") if not -x $script;
+	my @cmd = ( $script, $job{'remoteHostName'}, $jobname, "'$job{'localSSHBinary'} $job{'_sshOpts'}'" );
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "Executing script $scrname failed." );
+}
+
+sub execPreJobCommand($) {
+	return if $Command ne "scheduled";
+	my $jobname=shift;
+	my %job=getJobConfig($jobname);
+	my %ps =  map { $_ => 0 } @{$job{"preJobCommand"}}; 
+	%ps = (%ps, map { $_ => 1 } @{$job{"preJobCommandRemote"}} );
+	foreach my $p (sort keys %ps ) {
+		if( $ps{$p} ) {
+			execJobCommandRemote($jobname,$p);
+		} else {
+			execJobCommand($jobname,$p);
+		}
+	}
+}
+sub execPostJobCommand($) {
+	return if $Command ne "scheduled";
+	my $jobname=shift;
+	my %job=getJobConfig($jobname);
+	my %ps =  map { $_ => 0 } @{$job{"postJobCommand"}}; 
+	%ps = (%ps, map { $_ => 1 } @{$job{"postJobCommandRemote"}} );
+	foreach my $p (sort keys %ps ) {
+		if( $ps{$p} ) {
+			execJobCommandRemote($jobname,$p);
+		} else {
+			execJobCommand($jobname,$p);
+		}
+	}
+}
+
+sub deduplicate($) {
+	return if $Command ne "scheduled";
+	my $jobname=shift;
+	my %job=getJobConfig($jobname);
+	return if $job{"dedup"} ne 'yes';
+	lg('Starting deduplicating');
+	if( not -x $dedupBinary ) {
+		lg( "Executable $dedupBinary not found. Skipping deduplicating");
+		return -1;
+	}
+	my $ar1=getLinkdest($jobname,0);
+	my $ar2=getLinkdest($jobname,1);
+	if( $ar1 ne 'scheduled.0' || not $ar2 ) {
+		lg('No archives found to deduplicate');
+		return -1;
+	}
+	lg( "Deduplicating $ar1 and $ar2 archives.");
+	my $rptfile=$job{'RootDir'}."/$jobname/scheduled.0/.AFFA3-REPORT";
+	my $rpt=Config::IniFiles->new( -file => $rptfile ) if( -f $rptfile );
+	my $exectime=time();
+	my @cmd=($dedupBinary,'-upg',"$job{'RootDir'}/$jobname/$ar1","$job{'RootDir'}/$jobname/$ar2",'2>&1','|','/bin/egrep','"(size of replaced files was [0-9]* bytes|[0-9]+ replaced by links)\.$"');
+	my $stat=ExecCmd( @cmd, 0 );
+	$exectime=time()-$exectime;
+	$ExecCmdOutout=~s/\n//;
+	$ExecCmdOutout=~/([0-9]+) files of ([0-9]+) replaced by links.*?replaced files was ([0-9]+) bytes/;
+	my $replacedFiles=defined $1 ? $1 : -1;
+	my $totalFiles=defined $2 ? $2 : -1;
+	my $savedBytes=defined $3 ? $3 : -1;
+	if( $stat==0 && $replacedFiles>=0 && $totalFiles>=0 && $savedBytes>=0 
+			&& !$rpt->exists('Report','DedupDate') ) {
+		$rpt->newval('Report','DedupTotalFiles',$totalFiles);
+		$rpt->newval('Report','DedupReplacedFiles',$replacedFiles);
+		$rpt->newval('Report','DedupSavedBytes',$savedBytes);
+		$rpt->newval('Report','DedupExectime',$exectime);
+		$rpt->newval('Report','DedupDate', Date::Format::time2str("%Y%m%d%H%M",time()));
+		$rpt->RewriteConfig();
+		lg('Deduplicating completed. Yield is ' . sizeUnit($savedBytes) . ' Bytes.');
+	} else {
+		lg('Deduplicating failed with bad status');
+	}
+}
+
+sub listJobs() {
+	$interactive=1;
+	foreach my $job ($cfg->Sections()) {
+		next if $job eq 'GlobalAffaConfig';
+		print "$job\n";
+	}
+}
+
+sub jobsnrpe($) {
+	my $init=shift;
+	$interactive=1;
+	my $af;
+	my $nf;
+	if( -f "/etc/nagios/nrpe.cfg" ) {
+		$af="/etc/nagios/affa-nrpe.cfg";
+		$nf="/etc/nagios/nrpe.cfg";
+	} elsif( -f "/etc/icinga/nrpe.cfg" ) {
+		$af="/etc/icinga/affa-nrpe.cfg";
+		$nf="/etc/icinga/nrpe.cfg";
+	} else {
+		print "# NRPE is not installed on the Affa server\n";
+		return -1;
+	}
+	open(FO, ">$af");
+	print FO "command[check_affa]=sudo /sbin/affa --nrpe\n";
+	print FO "command[affa_jobsnrpe]=sudo /sbin/affa --_jobsnrpe\n";
+	print FO "command[affa_diskusagenrpe]=sudo /sbin/affa --disk-usage --csv\n";
+	foreach my $jobname ($cfg->Sections()) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+		next if( $job{'NRPEtrigger'} < 0 || $job{'status'} ne 'enabled' );
+		print "$jobname\n" if not $init;
+		print FO "command[check_affa_$jobname]=sudo /sbin/affa --nrpe $jobname\n";
+	}
+	print "#OK\n" if not $init;
+	close(FO);
+	system("grep -v 'include=$af' $nf > $nf-$$ && echo include=$af>>$nf-$$ && mv -f $nf-$$ $nf && /etc/init.d/nrpe restart");
+}
+
+sub listArchives() {
+	$interactive=1;
+	if( not $ARGV[0] )
+		{
+		foreach my $job( sort $cfg->Sections() )
+			{
+			next if $job eq 'GlobalAffaConfig';
+			push( @ARGV, $job );
+			}
+		}
+
+	my $out='';
+	foreach my $jobname (@ARGV ) {
+		$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+		my @csv = listArchivesRaw($jobname);
+		my %job=getJobConfig($jobname);
+		if( $opts{'csv'} ) {
+			$out = join( "\n", @csv ) .  "\n";
+		} else {
+			$out .= $out ? "\n" : "$affaTitle\n";
+			shift(@csv);
+			my $h;
+
+################### début modifs
+#			($h = sprintf "+-%076s-+\n", '-') =~ s/0/-/g;
+			($h = sprintf "+-%0102s-+\n", '-') =~ s/0/-/g;
+
+			$out .= $h;
+
+#			$out .= sprintf( "| Job: %-71s |\n", $jobname );
+#			$out .= sprintf( "| Description: %-63s |\n", $job{'Description'} ) if $job{'Description'}; 
+#			$out .= sprintf( "| Directory: %-65s |\n", $job{'RootDir'}."/$jobname/" );
+#			$out .= sprintf( "| Hostname: %-66s |\n", $job{'remoteHostName'} );
+
+			$out .= sprintf( "| Job: %-97s |\n", $jobname );
+			$out .= sprintf( "| Description: %-89s |\n", $job{'Description'} ) if $job{'Description'};
+			$out .= sprintf( "| Directory: %-91s |\n", $job{'RootDir'}."/$jobname/" );
+			$out .= sprintf( "| Hostname: %-92s |\n", $job{'remoteHostName'} );
+
+
+			if( $job{'AutomountDevice'} and $job{'AutomountPoint'} ) {
+				$out .= sprintf( "| AutomountDevice: %-59s |\n", $job{'AutomountDevice'} );
+				$out .= sprintf( "| AutomountPoint: %-60s |\n", $job{'AutomountPoint'} );
+				$out .= sprintf( "| AutoUnmount: %-63s |\n", $job{'AutoUnmount'} );
+			}
+			my $etxt="Email:";
+			foreach my $s (@{$job{'EmailAddress'}}) {
+#				$out .= sprintf( "| %6s %-69s |\n", $etxt, trim($s) );
+				$out .= sprintf( "| %6s %-95s |\n", $etxt, trim($s) );
+
+				$etxt='';
+			}
+
+# ligne	d'origine	($h = sprintf "+%05s+%022s+%08s+%08s+%07s+%07s+%07s+%07s+\n", '-','-','-','-','-','-','-','-') =~ s/0/-/g;
+# ligne du patch affa2	($h = sprintf "+-%05s-+-%021s-+-%09s-+-%040s-+-%06s-+-%06s-+\n", '-','-','-','-','-','-') =~ s/0/-/g;
+# ligne modif AG
+#			($h = sprintf "+%05s+%022s+%08s+%08s+%07s+%07s+%07s+%07s+%25s+\n", '-','-','-','-','-','-','-','-','-') =~ s/0/-/g;
+# fin modif
+			my $out2='';
+			my $lastArchive='';
+			my $tag=0;
+			foreach my $k (@csv) {
+				my @c=split(";", $k );
+				my $valid = $c[7] ne "yes" ? 0 : 1;
+				my $date = ($valid and $c[2] ne '197001010000' ) ? formatHTime($c[2]) : "Incomplete!";
+
+				my $NumberOfFiles = ($valid and $c[3]) ? countUnit($c[3]) : '-';
+# ligne du patch affa2		my $NumberOfFiles = ($valid and $c[3]) ? ($c[3]) : '-';
+# ligne du patch affa2		$NumberOfFiles =~ s/,//g;
+
+
+				my $TotalFileSize = ($valid and $c[4]) ? sizeUnit($c[4]) : '-';
+				my $TotalBytesReceived = ($valid and $c[8]>=0) ? sizeUnit($c[8]) : '-';
+				my $DiskUsage = ($valid and $c[5] and $c[6]) ? sizeUnit($c[6]*1024) . "/" . int($c[6]/($c[5]+$c[6])*100) . "%" : '-';
+				my $idx = sprintf '%s%2d', uc(substr($c[0],0,1)),$c[1];
+				my $ExecTime = !$valid || $c[9] eq '-' ? '-' : timeUnit($c[9]);
+				if( $c[1]>=$job{$c[0]."Keep"} ) {
+					$idx = "*$idx";
+					$tag++;
+				} else {
+					$idx = " $idx";
+				}
+				if( $lastArchive ne $c[0] ) {
+					$lastArchive=$c[0];
+					$out2 .= $h;
+				}
+				my $DedupSavedBytes='-';
+				my $DedupExectime='-';
+
+				if( defined $c[13] && $c[13] ne '' ) {
+					$DedupSavedBytes=sizeUnit($c[12]);
+					$DedupExectime=timeUnit($c[13]);
+				}
+				if( $idx =~ /S.0/ && getProcessState($jobname) =~ /deduplicating/) {
+					$DedupSavedBytes='busy';
+					$DedupExectime='busy';
+				}
+
+# lignes d'origine			$out2 .= sprintf( "|%-4s | %-19s | %6s | %6s | %5s | %5s | %5s | %5s |\n", 
+#					$idx,$date,$ExecTime,$DedupExectime,$DedupSavedBytes,
+#					$NumberOfFiles,$TotalFileSize,$TotalBytesReceived );
+
+# ligne du patch Affa2		$out2 .= sprintf( "| %-5s | %-21s | %9s | %40s | %6s | %6s |\n", $idx,$date,$ExecTime,$NumberOfFiles,$TotalFileSize,$TotalBytesReceived );
+
+# lignes modifiée AG
+					$out2 .= sprintf( "|%-5s | %-42s | %9s | %6s | %5s | %5s | %5s | %5s |\n",
+					$idx,$date,$ExecTime,$DedupExectime,$DedupSavedBytes,
+					$NumberOfFiles,$TotalFileSize,$TotalBytesReceived );
+
+
+
+			}
+			if( $lastArchive ) {
+				$out .= sprintf "| %-76s |\n", "Archives with an index greater than the Keep value are tagged with '*'" if $tag;
+# ligne du patch Affa2				$out .= sprintf "| %-102s |\n", "Archives with an index greater than the Keep value are tagged with '*'" if $tag;
+
+
+				$out .= $h;
+# ligne d'origine		$out .= sprintf "| %-3s | %-20s | %6s | %6s | %5s | %5s | %5s | %5s |\n", 'Run','Completion date', 'buTime', 'ddTime', 'ddYld', 'Files', 'Size', 'Recvd';
+# ligne du patch Affa2		$out .= sprintf "| %-5s | %-21s | %9s | %-40s | %6s | %6s |\n", "Run","Completion date", "Exec Time", "Files", "Size", "Recvd";
+# ligne modifiée AG ci-dessous
+				$out .= sprintf "| %-5s | %-41s | %9s | %6s | %5s | %5s | %5s | %5s |\n", 'Run','Completion date', 'buTime', 'ddTime', 'ddYld', 'Files', 'Size', 'Recvd';
+
+
+			} else {
+#				($h = sprintf "+-%076s-+\n", '-') =~ s/0/-/g;
+# ligne du patch Affa2 ci dessous
+				($h = sprintf "+-%0102s-+\n", '-') =~ s/0/-/g;
+
+			}
+			$out2 .= $h;
+			$out = $out.$out2;
+		}
+	}
+	return $out;
+}
+
+sub listArchivesRaw($) {
+	my $jobname=shift @_ ||'';
+	if( not $cfg->SectionExists($jobname) ) {
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	my @out = ('Archive:Count;Date;Files;Size;RootDirFilesystemAvail;RootDirFilesystemUsed;valid;TotalBytesReceived;ExecutionTime;DedupTotalFiles;DedupReplacedFiles;DedupSavedBytes;DedupExectime;DedupDate');
+	my %js;
+	my %js2;
+	my @jobdirs;
+	foreach my $k (<$job{'RootDir'}/$jobname/*>) {
+		push( @jobdirs, $k) if $k =~ /\/(scheduled|daily|weekly|monthly|yearly)\.[0-9]/;
+		
+	}
+	foreach my $record ( sort @jobdirs ) {
+		(my $k=$record)=~s/.*\///;
+		$k =~ s/scheduled/A-scheduled/; 
+		$k =~ s/daily/B-daily/; 
+		$k =~ s/weekly/C-weekly/; 
+		$k =~ s/monthly/D-monthly/; 
+		$k =~ s/yearly/E-yearly/;
+		(my $a, my $b) = split(/\./,$k);
+		$js{$a.sprintf("-%05d",$b)}="$record/.AFFA3-REPORT";
+		$js2{$a.sprintf("-%05d",$b)}="$record/.AFFA-REPORT";
+	}
+
+	foreach my $k ( reverse sort keys %js ) {
+		(my $a, my $b, my $c) = split(/-/,$k);
+		my $Date=0;
+		my $NumberOfFiles=0;
+		my $TotalFileSize=0;
+		my $TotalBytesReceived=0;
+		my $RootDirFilesystemAvail=0;
+		my $valid="no";
+		my $RootDirFilesystemUsed=0;
+		my $ExecutionTime=0;
+		my $DedupTotalFiles='';
+		my $DedupReplacedFiles='';
+		my $DedupSavedBytes='';
+		my $DedupExectime='';
+		my $DedupDate='';
+
+		if( -f $js{$k} or -f $js2{$k} ) {
+			if( not -f $js{$k} ) {
+				convertReportV2toV3($js{$k}, $js2{$k});
+			}
+			my $rpt= Config::IniFiles->new( -file => $js{$k} );
+			$Date=$rpt->val('Report','Date');
+			$NumberOfFiles=$rpt->val('Report','NumberOfFiles');
+
+			$TotalFileSize=$rpt->val('Report','TotalFileSize');
+			$TotalBytesReceived=$rpt->val('Report','TotalBytesReceived');
+# ligne du patch affa2	(my $TotalFileSize=$v->prop('TotalFileSize')||0) =~ s/(\D*)*/$1/g;
+# ligne du patch affa2	(my $TotalBytesReceived=$v->prop('TotalBytesReceived')||0) =~ s/(\D*)*/$1/g;
+
+			$RootDirFilesystemAvail=$rpt->val('Report','RootDirFilesystemAvail');
+			$RootDirFilesystemUsed=$rpt->val('Report','RootDirFilesystemUsed');
+			$ExecutionTime=$rpt->val('Report','ExecutionTime');
+			$valid="yes";
+			if( $rpt->exists('Report','DedupExectime') ) {
+				$DedupTotalFiles=$rpt->val('Report','DedupTotalFiles');
+				$DedupReplacedFiles=$rpt->val('Report','DedupReplacedFiles');
+				$DedupSavedBytes=$rpt->val('Report','DedupSavedBytes');
+				$DedupExectime=$rpt->val('Report','DedupExectime');
+				$DedupDate=$Date;
+				$DedupDate=$rpt->val('Report','DedupDate') if $rpt->exists('Report','DedupDate');
+			}
+		}
+
+		push( @out,  "$b;$c" 
+			. ";". $Date
+			. ";". $NumberOfFiles
+			. ";". $TotalFileSize
+			. ";". $RootDirFilesystemAvail
+			. ";". $RootDirFilesystemUsed
+			. ";". $valid
+			. ";". $TotalBytesReceived
+			. ";". $ExecutionTime
+			. ";". $DedupTotalFiles
+			. ";". $DedupReplacedFiles
+			. ";". $DedupSavedBytes
+			. ";". $DedupExectime
+			. ";". $DedupDate
+			);
+	}
+	return @out;
+}
+
+
+sub nrpe() {
+	my $exitstat=0;
+	my @failed;
+	my $jobcnt=0;
+	my $jobckcnt=0;
+	my $STATUS='OK';
+	my $total_exectime=0;
+	my $total_size=0;
+	if( not $ARGV[0] ) {
+		foreach my $job( sort $cfg->Sections() ) {
+			next if $job eq 'GlobalAffaConfig';
+			push( @ARGV, $job );
+		}
+	}
+	my $lastrun;
+	my $done=0;
+	my $state;
+	foreach my $jobname (@ARGV ) {
+		my %job=getJobConfig($jobname);
+
+		my $rptfile=$job{'RootDir'}."/$jobname/scheduled.0/.AFFA3-REPORT";
+		$rptfile= -f $rptfile ? $rptfile : $job{'RootDir'}."/$jobname/daily.0/.AFFA3-REPORT";
+
+		my $rpt;
+		$rpt= Config::IniFiles->new( -file => $rptfile ) if( -f $rptfile );
+
+		my $last =  $rpt ? $rpt->val('Report','Date') : '19700101000000';
+		$lastrun=formatHTime($last);
+		$state=getProcessState($jobname);
+		my $exectime = $rpt ? $rpt->val('Report','ExecutionTime') : 0;
+		my $size = $rpt ? $rpt->val('Report','TotalFileSize') : 0;
+
+		$exectime=$exectime?$exectime:0;
+		next if $job{'NRPEtrigger'}<=0;
+		$jobcnt++;
+		next if $job{'status'} ne 'enabled';
+		$jobckcnt++;
+		$total_exectime+=$exectime if $exectime=~/\d/;
+		$total_size+=$size if $size=~/\d/;
+		$last=hTime2Timestamp($last);
+		if( !$state && $last + 3600*$job{'NRPEtrigger'} < $curtime || $state=~/interrupted/ ) {
+			push(@failed,$jobname);
+			$STATUS='CRITICAL';
+			$exitstat=2;
+		}
+		$done++;
+	}
+	return 0 if !$done;
+
+	print "$STATUS: ";
+	if( scalar @ARGV == 1 ) {
+		print $state?$state:$lastrun;
+	} else {
+		if( $STATUS eq 'CRITICAL' ) {
+			print "Failed jobs: " . join(' ',@failed) . ' ';
+		} else {
+			print "$jobckcnt of $jobcnt jobs are enabled. ";
+		}
+	}
+	print '|';
+	my $totaltxt='';
+	if( scalar @ARGV > 1 ) {
+		printf ("Jobs failed=%d;;;; ",scalar @failed);
+		printf ("Jobs total=%d;;;; ",$jobcnt);
+		printf ("Jobs checked=%d;;;; ",$jobckcnt);
+		$totaltxt="Total ";
+	}
+	printf ("$totaltxt"."Execution Time=%0.1fmin;;;; ",$total_exectime/60);
+	printf ("$totaltxt"."Size=%0.3fGByte;;;; ",$total_size/1024/1024/1024);
+	print "\n";
+	return $exitstat;
+}
+
+sub getStatus() {
+	$interactive=1;
+	my @csv = getStatusRaw();
+	my $out = "$affaTitle\n";
+	if( $opts{'csv'} ) {
+		$out = join( "\n", @csv ) .  "\n";
+	} else {
+		shift(@csv);
+		my $jobcolw=2;
+		foreach my $k (@csv) {
+			my @c=split(";", $k );
+			$jobcolw = length($c[0]) if $jobcolw<length($c[0]);
+		}
+		$jobcolw=3 if( $jobcolw<3 );
+
+#		$jobcolw=12 if( $jobcolw>12 );
+#ligne suivante modifiée AG
+		$jobcolw=38 if( $jobcolw>38 );
+
+		(my $h = sprintf "+%0".($jobcolw+2)."s+%05s+%07s+%08s+%07s+%07s+%07s+%016s+\n", 
+			'-', '-', '-', '-', '-','-','-','-') =~ s/0/-/g;
+		$out .= $h;
+		$out .= sprintf "| %-".$jobcolw."s | %3s | %5s | %6s | %5s | %5s | %5s | %14s |\n", 'Job', 'ENA', 'Last', 'Time', 'Next', 'Size', 'ddYld', 'N of S,D,W,M,Y';
+		$out .= $h;
+		my $eo='';
+		my $do='';
+		my $disabled=0;
+		foreach my $k (sort @csv) {
+			(my $thisjob,my $status,my $lastrun, my $netxrun, my $TotalFileSize,my $avail, my $used, my $nof, my $lock, my $state, my $BackupTime,my $DedupTotalFiles,my $DedupReplacedFiles,my $DedupSavedBytes,my $DedupExectime,my $DedupDate)=split(";", $k );
+			if( $DedupExectime ne '' ) {
+				$DedupSavedBytes=sizeUnit($DedupSavedBytes);
+				$lastrun=$DedupDate if defined $DedupDate;
+			} else {
+				$DedupSavedBytes='-';
+				$DedupExectime=0;
+			}
+			$lastrun = $status eq "yes" ? ($lastrun eq '19700101000000'?'never':'ERROR') : '-' if $curtime-hTime2Timestamp($lastrun) > 86400;
+			$lastrun =~ s/\d{8}(\d\d)(\d\d)/$1:$2/;
+			$thisjob = length($thisjob)>$jobcolw ? substr($thisjob,0,$jobcolw-2).".." : $thisjob;
+			$TotalFileSize=$TotalFileSize ? sizeUnit($TotalFileSize) : '-';
+			my $line='';
+			my $TotalExecTime='-';
+			if( $BackupTime ne '' ) {
+				$TotalExecTime=timeUnit($BackupTime+$DedupExectime);
+			}
+			if(  !$lock && not $state =~ 'interrupted' ) {
+				$line = sprintf "| %-".$jobcolw."s | %3s | %5s | %6s | %5s | %5s | %5s | %14s |\n", 
+				$thisjob, $status, $lastrun, $TotalExecTime, $netxrun, $TotalFileSize, $DedupSavedBytes, $nof;
+			} else {
+				my $ps=$lock ? "(pid $lock)":'';
+				$line = sprintf "| %-".$jobcolw."s | %3s | %-38s | %14s |\n", 
+				$thisjob, $status,  "$state $ps", $nof;
+			}
+			if( $status eq "no" && not $state ) {
+				$do.=$line;
+				$disabled++;
+			} else {
+				$eo.=$line;
+			}
+		}
+		if( $opts{'all'} ) {
+			$do = $h.$do if $do && $eo;
+			$out .= $eo.$do.$h;
+		} else {
+			$out .= $eo.$h;
+			$out.=sprintf "%d disabled jobs not listed. Use --all to display.\n", $disabled if $disabled;
+		}
+	}
+	return $out;
+}
+
+sub getStatusRaw() {
+	my $txt;
+	my $lock;
+	my $lockpid=0;
+	my @out="Job;Enabled;Last;Next;Size;RootDirFilesystemAvail;RootDirFilesystemUsed;NumberOfArchives;lockpid;ProcessState;BackupTime;DedupTotalFiles;DedupReplacedFiles;DedupSavedBytes;DedupExectime;DedupDate";
+	my @sections= $cfg->Sections();
+	foreach my $jobname( reverse sort @sections ) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+
+		my $rptfile=$job{'RootDir'}."/$jobname/scheduled.0/.AFFA3-REPORT";
+		my $rpt;
+		$rpt= Config::IniFiles->new( -file => $rptfile ) if( -f $rptfile );
+
+		# lockpid
+		my $lock = getLock($jobname); 
+
+		# process state
+		my $state=getProcessState($jobname);
+		# status
+		my $status=$job{'status'} eq "enabled" ? "yes" : "no";
+
+ 		# Number of archives
+ 		my $total=0;
+ 		my %acnt=('scheduled'=>0,'daily'=>0,'weekly'=>0,'monthly'=>0,'yearly'=>0);
+		my $jobpath=$job{'RootDir'}."/$jobname";
+		foreach my $k (<$jobpath/*>) {
+			$k=~s/.*\/(.*?)\.[0-9]$/$1/;
+ 			$acnt{$k}++;
+ 			$total++;
+		}
+
+ 		# Last and next run
+ 		my $nowTime = Date::Format::time2str("%H%M",time());
+ 		my @s; 
+		my @u=@{$job{'TimeSchedule'}};
+ 		foreach my $z (sort @u) {
+ 			$z=trim($z);
+ 			push( @s, $z ) if( length( $z) == 4  and $z == sprintf( "%04d", int($z) ) );
+ 		}
+ 		@u = sort { $a <=> $b } @s;
+ 		push( @u, $u[0] );
+ 		(my $netxrun=$u[0]) =~ s/(..)(..)/$1:$2/;
+ 		for( my $i=0; $i<@u; $i++ ) {
+ 			if( $nowTime < $u[$i] ) {
+ 				($netxrun = $u[$i]) =~ s/(\d\d)(\d\d)/$1:$2/;
+ 				last;
+ 			}
+ 		}
+
+		my $lastrun =  $rpt ? $rpt->val('Report','Date') : '19700101000000';
+ 
+ 		# Size
+ 		(my $TotalFileSize=$rpt ? $rpt->val('Report','TotalFileSize'):0) =~ s/.*?(\d*).*/$1/;
+# ligne du patch affa2		(my $TotalFileSize=$props{'TotalFileSize'}||0) =~ s/(\D*)*/$1/g;
+# ligne modifiée AG		(my $TotalFileSize=$rpt ? $rpt->val('Report','TotalFileSize'):0) =~ s/(\D*)*/$1/g;
+
+ 		$TotalFileSize = int($TotalFileSize);
+ 
+ 		# Disk usage
+ 		(my $used=$rpt?$rpt->val('Report','RootDirFilesystemUsed'):0) =~ s/ .*//;
+ 		(my $avail=$rpt?$rpt->val('Report','RootDirFilesystemAvail'):0) =~ s/ .*//;
+ 
+ 		# Backup execution time
+ 		my $BackupTime=$rpt?$rpt->val('Report','ExecutionTime'):'';
+
+		my $ExecutionTime=0;
+		my $DedupTotalFiles='';
+		my $DedupReplacedFiles='';
+		my $DedupSavedBytes='';
+		my $DedupExectime='';
+		my $DedupDate='';
+		if( $rpt && $rpt->exists('Report','DedupExectime') ) {
+			$DedupTotalFiles=$rpt->val('Report','DedupTotalFiles');
+			$DedupReplacedFiles=$rpt->val('Report','DedupReplacedFiles');
+			$DedupSavedBytes=$rpt->val('Report','DedupSavedBytes');
+			$DedupExectime=$rpt->val('Report','DedupExectime');
+			$DedupDate=$lastrun;
+			$DedupDate=$rpt->val('Report','DedupDate') if $rpt->exists('Report','DedupDate');
+		}
+ 
+ 		my $nof = sprintf "%2d,%2d,%2d,%2d,%2d", $acnt{'scheduled'}, $acnt{'daily'}, $acnt{'weekly'}, $acnt{'monthly'}, $acnt{'yearly'};
+ 		push( @out, "$jobname;$status;$lastrun;$netxrun;$TotalFileSize;$avail;$used;$nof;$lock;$state;$BackupTime;$DedupTotalFiles;$DedupReplacedFiles;$DedupSavedBytes;$DedupExectime;$DedupDate");
+	}
+	return @out;
+}
+
+sub convertReportV2toV3($$) {
+	(my $fn, my $f)=@_;
+	open( DF, ">$fn" );
+	print DF "; converted from .AFFA-REPORT (Affa V2)\n";
+	lg( "converting report file $f to $fn");
+	print DF "[Report]\n";
+	open( AS, "<$f" );
+	while( <AS> ) {
+		next if /^[ \t]*#/ or not /: /;
+		chomp($_);
+		$_=~/(.*?):(.*)/;
+		my $prop=trim($1);
+		next if $prop=~/^File/;
+		my $val=trim($2);
+		next if not $val =~ /^[\-0-9]/ and not $prop =~ /^Date/;
+		$val=~/([\-0-9.]+)(.*)/;
+		$val = $1;
+		my @ps = split( " ", $prop );
+		$prop='';
+		foreach my $k (@ps) {
+			$prop .= ucfirst($k);
+		}
+		print DF "$prop=$val\n";
+	}
+	close(AS);
+	close(DF);
+	(my $d=$f)=~s/\.AFFA-REPORT//;
+	system("touch -r $f $d");
+}
+
+sub df($) {
+	my $dir=shift;
+	my $df = new Filesys::DiskFree;
+	$df->df();
+	return (int($df->used($dir)/1024),int($df->avail($dir)/1024));
+}
+
+sub DiskUsage() {
+	my @csv=DiskUsageRaw();
+	my $out = "$affaTitle\n";
+	if( $opts{'csv'} ) {
+		$out = join( "\n", @csv ) .  "\n";
+	} else {
+		(my $h = sprintf "+-%04s-+-%06s-+-%06s-+-%050s-+\n", '-','-','-','-') =~ s/0/-/g;
+		$out .= $h;
+		$out .= sprintf "| %4s | %6s | %6s | %-50s |\n", "Use%", "Used", "Avail", "Root Dir";
+		$out .= $h;
+		shift(@csv);
+		foreach my $k (@csv) {
+			my @c=split(";", $k );
+			$c[0]=~s/"//g;
+			$c[0] =~ s/.*(.{47})$/...$1/ if length($c[0])>50;
+			if( $c[1] eq '-' or $c[2] eq '-' ) {
+				$out .= sprintf "| %4s | %6s | %6s | %-50s |\n",'-','-','-',$c[0];;
+			} else {
+				$out .= sprintf "| %4s | %6s | %6s | %-50s |\n",
+					int($c[2]/($c[1]+$c[2])*100)."%", # Use%
+					sizeUnit($c[2]*1024), # Used
+					sizeUnit($c[1]*1024), # Avail
+					$c[0];
+			}
+		}
+		$out .= $h;
+	}
+	return $out;
+}
+
+sub DiskUsageRaw() {
+	my @out=('RootDir;RootDirFilesystemAvail;RootDirFilesystemUsed');
+	my %done;
+	foreach my $jobname( reverse sort $cfg->Sections()  ) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+		my $RootDir = $job{'RootDir'};
+		next if $done{$RootDir};
+		$done{$RootDir}=1;
+		my $used = '-';
+		my $avail = '-';
+		my $dev = $job{'AutomountDevice'};
+		my $mountPoint = $job{'AutomountPoint'};
+		my $mountOptions = $job{'AutomountOptions'};
+		if( $RootDir && $mountPoint && $RootDir =~ /$mountPoint/ ) {
+			mount($dev,$mountPoint, $mountOptions) if $dev and $mountPoint;
+			($used, $avail) = df( $RootDir) if isMounted($dev,$mountPoint);
+			unmount($dev,$mountPoint) if $dev and $mountPoint;
+		} elsif( $RootDir && -x $RootDir ) {
+			($used, $avail) = df( $RootDir);
+		}
+		push( @out,"\"$RootDir\";$avail;$used");
+	}
+	return @out;
+}
+
+# ajout pour V3.2.2-2
+sub checkForDiskLabel($) {
+        my $dev = $_[0];
+        my $result = $dev;
+        if ( $dev =~ "/by-label/" ) {
+                $result = "/dev/" . basename(readlink($dev));
+                lg("Mapping disk label to device: $dev links to $result\n");
+        }
+        return $result;
+}
+
+# fin ajout
+
+sub isMounted($$) {
+	(my $dev, my $AutomountPoint) = @_;
+	$AutomountPoint =~ s/\/$//;
+# ajout pour V3.2.2-2
+	$dev = checkForDiskLabel($dev);
+# fin ajout
+	$dev =~ s/\/$//;
+	my $txt="Check mounted: $dev $AutomountPoint";
+	my $df = new Filesys::DiskFree;
+	my $result=0;
+	$df->df();
+	(my $df_AutomountPoint=$df->device($AutomountPoint))  =~ s/\/$//;
+	if( $df_AutomountPoint =~ "^/dev/mapper/" && not ($dev =~ "^/dev/mapper") ) {
+		# convert /dev/mapper/VG-LV to /dev/VG/LV
+		(my $d=$df_AutomountPoint) =~ s;^/dev/mapper/(.*)-(.*)$;/dev/$1/$2;;
+		$result=1 if( $d eq $dev );
+	}
+	$result |= $df_AutomountPoint eq $dev;
+	dbg( "$txt. Result: " . ($result?'yes':'no ') );
+	return $result;
+}
+
+sub mount($$$) {
+	(my $dev, my $AutomountPoint, my $options) = @_;
+	$AutomountPoint =~ s/\/$//;
+	return if isMounted( $dev, $AutomountPoint );
+	File::Path::mkpath( $AutomountPoint, 0, 0700 ) if not -d $AutomountPoint;
+	lg( "Mounting $dev to $AutomountPoint");
+	my @cmd=('/bin/mount', $options, $dev, $AutomountPoint );
+	if( ExecCmd( @cmd, 0 ) ) {
+		my $s="Couldn't mount $dev $AutomountPoint";
+		if( $Command ) {
+			affaErrorExit( $s );
+		} else {
+			lg($s);
+		}
+	}
+	$autoMounted{$AutomountPoint}=$dev if $job{'AutoUnmount'} eq 'yes';
+}
+
+sub unmount($$) {
+	(my $dev, my $AutomountPoint) = @_;
+	$AutomountPoint =~ s/\/$//;
+	return if not $autoMounted{$AutomountPoint} or $autoMounted{$AutomountPoint} ne $dev or not isMounted( $dev, $AutomountPoint );
+	my @cmd=('/bin/umount', '-l', $AutomountPoint );
+	lg( "Unmounting $AutomountPoint");
+	not ExecCmd( @cmd, 0 ) or lg("Couldn't unmount $AutomountPoint");
+}
+
+sub unmountAll() {
+	while( (my $AutomountPoint, my $dev) = each( %autoMounted ) ) {
+		unmount( $dev, $AutomountPoint);
+	}
+}
+
+sub checkCrossFS($$) {
+	(my $fs1, my $fs2) = @_;
+	my $fn=".affa.checkCrossFS.$$";
+	unlink( "$fs1/$fn" ) if -e "$fs1/$fn";
+	unlink( "$fs2/$fn" ) if -e "$fs2/$fn";
+	open( OUT, ">$fs1/$fn"); print OUT "test"; close(OUT);
+	link( "$fs1/$fn", "$fs2/$fn" );
+	my $res = -e "$fs2/$fn" ? 0 : 1;
+	unlink( "$fs1/$fn" ) if -e "$fs1/$fn";
+	unlink( "$fs2/$fn" ) if -e "$fs2/$fn";
+	return $res;
+}
+
+sub DiskSpaceWarn() {
+	return if $Command ne 'scheduled' or $job{'DiskSpaceWarn'} eq 'none';
+	lg( "Checking disk space." );
+	(my $used, my $avail) = df( $job{'RootDir'} );
+	my $report=Config::IniFiles->new( -file => "$job{'RootDir'}/$jobname/scheduled.0/.AFFA3-REPORT");
+	my $needed=int($report->val('Report', 'TotalFileSize')/1024);
+	$needed=int($needed*0.5) if $job{'DiskSpaceWarn'} eq 'normal';
+	$needed=int($needed*0.1) if $job{'DiskSpaceWarn'} eq 'risky';
+	if( $avail<$needed ) {
+		my $msg = new Mail::Send;
+		$msg->subject("Warning: Affa server $hostname running out of disk space!");
+		$msg->to($job{'_EmailAddress'});
+		$msg->set("From", "\"Affa Server $hostname\" <noreply\@$Domain>");
+		my $s;
+		my $fh = $msg->open;
+		print $fh "This message was sent by job '$jobname'.\n";
+		$s = "Configured threshold type: $job{'DiskSpaceWarn'}\n"; print $fh $s; lg($s);
+		$s = "Disk space left: " . sizeUnit(int($avail*1024)) . "\n"; print $fh $s; lg($s);
+		$s = "Used disk space: " . sizeUnit(int($used*1024)) . "\n"; print $fh $s; lg($s);
+		$s = "Disk size: " . sizeUnit(int(($avail+$used)*1024)) . "\n"; print $fh $s; lg($s);
+		close( $fh );
+		lg( "Running out of disk space message sent to " . $job{'_EmailAddress'} );
+	}
+}
+
+sub getReportVal($$) {
+	(my $jobname, my $archive)=@_;
+	my $rptfile=$job{'RootDir'}."/$jobname/$archive/.AFFA3-REPORT";
+	my $rpt = Config::IniFiles->new( -file => $rptfile ) if( -f $rptfile );
+	my $val='';
+	if( $rpt && $rpt->exists('Report','Date') ) {
+		$val = $rpt->val('Report','Date');
+	}
+	return $val;
+}
+
+sub checkArchiveExists($$) {
+	(my $jobname, my $archive)=@_;
+	if( not $cfg->SectionExists($jobname) ) { 
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig($jobname);
+	if( not -f "$job{'RootDir'}/$jobname/$archive/.AFFA3-REPORT" ) {
+		$interactive=0;
+		my $dir = opendir( DIR, "$job{'RootDir'}/$jobname" );
+		my $ar;
+		my %va;
+		while( defined ($ar=readdir(DIR)) ) {
+			next if not $ar =~ /^(scheduled|daily|weekly|monthly|yearly)\.[0-9]+$/;
+			my $d=getReportVal($jobname, $ar);
+			if( $d ) {
+				$va{$ar}=$d;
+			}
+		}
+		my $txt="Error: Archive $archive not found.";print "$txt\n"; lg($txt);
+		$txt= "The following archives exist:";print "$txt\n"; lg($txt);
+		foreach my $k (sort {$va {$a} cmp $va {$b}} keys %va) {
+			$txt=sprintf "  %-12s: %s",$k,formatHTime($va{$k});print "$txt\n"; lg($txt);
+		}
+		affaErrorExit( "." );
+	}
+}
+
+
+# remove archives which have indices greater than the Keep value
+sub	cleanup() {
+	my $jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $txt;
+	my @cmd;
+	if( not $cfg->SectionExists($jobname) ) {
+		$txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	my $dir = opendir( DIR, "$job{'RootDir'}/$jobname" );
+	my %archives;
+	my $cnt=0;
+	if( $dir ) {
+		my $af;
+		while( defined ($af=readdir(DIR)) ) {
+			next if not $af =~ /^(scheduled|daily|weekly|monthly|yearly)\.[0-9]+$/;
+			(my $k, my $b)=split(/\./, $af);
+			next if( $b<$job{$k."Keep"} );
+			$k =~ s/scheduled/A/; $k =~ s/daily/B/; $k =~ s/weekly/C/; $k =~ s/monthly/D/; $k =~ s/yearly/E/;
+			$archives{"$k".sprintf("%05d",$b)}=$af;
+			$cnt++;
+		}
+	}
+	if( $cnt ) {
+		print "\nWARNING: The following $cnt archives will be deleted!\n";
+		foreach my $k ( reverse sort keys %archives ) {
+			print "$archives{$k}\n";
+		}
+		my $input='';
+		print "Type 'proceed' to confirm or <ENTER> to cancel: ";
+		$input = lc(<STDIN>);
+		chomp( $input );
+		if( $input ne 'proceed' ) {
+			affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+		}
+		File::Path::mkpath( "$job{'RootDir'}/$jobname/.AFFA-TRASH", 0, 0700 ) unless -d "$job{'RootDir'}/$jobname/.AFFA-TRASH";
+		foreach my $k ( reverse sort keys %archives ) {
+			print "deleting archive $archives{$k} in background... "; $|++;
+			moveFileorDir("$job{'RootDir'}/$jobname/$archives{$k}","$job{'RootDir'}/$jobname/.AFFA-TRASH/$archives{$k}.$curtime-$$");
+			print " Done.\n";
+		}
+		removeDir( "$job{'RootDir'}/$jobname/.AFFA-TRASH",1 );
+	}
+}
+
+sub moveArchive() {
+	$jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $txt;
+	my @cmd;
+	if( not $cfg->SectionExists($jobname) ) {
+		$txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	(my $newdir=$ARGV[1])=~s/\/$//;
+	if( not $newdir ) {
+		$txt= "Error: New RootDir not given."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	if( not $newdir=~/^\// or $newdir=~/\.\./ ) {
+		$txt= "Error: Full path required for NEWROOTDIR."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	if( not -d $newdir ) {
+		my $input='';
+		while( not $input =~ /^(yes|no)$/ ) {
+			print "Directory $newdir does not exist. Create? (yes|no) ";
+			$input = lc(<STDIN>);
+			chomp( $input );
+		}
+		if( $input ne 'yes' ) {
+			$interactive=0;
+			affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+		}
+		File::Path::mkpath( $newdir, 0, 0700 );
+		}
+	my $err=0;
+	if( "$job{'RootDir'}/$jobname" ne "$newdir/$jobname" and -d "$job{'RootDir'}/$jobname" ) {
+		if( checkCrossFS( $job{'RootDir'}."/$jobname", $newdir ) ) {
+			$txt= "Warning: Cannot move across filesystems. Using copy and delete."; 
+			print("$txt\n"); lg($txt);
+			$txt= "Please wait..."; print("$txt\n"); lg($txt);
+			my @cmd=(
+				"/bin/tar", "--remove-files", "-C", $job{'RootDir'}, "-cf", '-', $jobname, 
+				"|", "/bin/tar", "-C", $newdir, "-xf", '-' );
+			$err=ExecCmd( @cmd, 0 );
+			if( $err ) {
+				$txt= "Error: Copying failed."; print("$txt\n"); lg($txt);
+			} else {
+				removeDir( $job{'RootDir'}."/$jobname",0 );
+			}
+		} else {
+			moveFileorDir( $job{'RootDir'}."/$jobname", "$newdir/$jobname" );
+		}
+	}
+	if( not $err ) {
+		my $err=rewriteConfigVal($jobname,'RootDir',$newdir);
+		lg("Changed 'RootDir' value to '$newdir' in config file of job '$jobname'") if( not $err);
+	}
+}
+
+sub renameJob() {
+	$jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $txt;
+	my @cmd;
+	if( not $cfg->SectionExists($jobname) ) { 
+		$txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	my $newname=$ARGV[1]||'';
+	$newname=~s/\//_/g;
+	if( not $newname ) {
+		$txt= "Error: No new jobname given."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	if( $cfg->SectionExists($newname) ) {
+		$txt= "Error: A job '$newname' already exists."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	if( -e "$job{'RootDir'}/$newname" ) {
+		$txt= "Error: $job{'RootDir'}/$newname already exists."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	if( -d "$job{'RootDir'}/$jobname" ) {
+		moveFileorDir( $job{'RootDir'}."/$jobname", $job{'RootDir'}."/$newname" );
+	}
+
+	# rename ssh HostKeyAlias
+	if( -f "/root/.ssh/knownhosts-$jobname" ) {
+		open(LF,"</root/.ssh/knownhosts-$jobname");
+		$_=<LF>;
+		s/^$jobname /$newname /;
+		close(LF);
+		open(LF,">/root/.ssh/knownhosts-$newname");
+		print LF;
+		close(LF);
+		unlink("/root/.ssh/knownhosts-$jobname");
+	}
+
+
+	# rename Section in config file
+	my $cfg=openOrgConfig($jobname);
+	$cfg->AddSection( $newname);
+	my @p=$cfg->Parameters($jobname);
+	foreach my $k (@p) {
+		 $cfg->newval($newname, $k, $cfg->val($jobname,$k));
+	}
+	$cfg->DeleteSection($jobname);
+	writeConfigFile($cfg);
+
+	# rename logfile
+	moveFileorDir("$logdir/$jobname.log","$logdir/$newname.log");
+
+	lg("Renamed job '$jobname' to '$newname'");
+	$jobname=$newname;
+	cronSetup();
+}
+
+sub writeConfigFile($) {
+	my $cfg=shift;
+	$cfg->RewriteConfig();
+	# replace 'here documents' by multiline values
+	my $file=$cfg->GetFileName();
+	my $key='';
+	open(HD, "<$file");
+	open(MP, ">$file.$$.$curtime");
+	while( <HD> ) {
+		my $e=trim($_);
+		$e=~s/(.*?)(= <<)(EOT)$//;
+		if( not $key and not $e ) {
+			$key=$1;
+			next;
+			}
+		if( $key and $e ne 'EOT' ) {
+			print MP "$key=$e\n";
+			next;
+		}
+		if( $e eq 'EOT' ) {
+			$key='';
+			next;
+		}
+		print MP "$e\n";
+	}
+	close(MP);
+	close(HD);
+	rename("$file.$$.$curtime",$file);
+	# force config re-read
+	unlink($configfile) if $configfile;
+	getJobConfig('');
+}
+
+# entirely remove a job
+sub	deleteJob() {
+	my $jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $txt;
+	my @cmd;
+	if( not $cfg->SectionExists($jobname) ) {
+		$txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	my $dir = opendir( DIR, "$job{'RootDir'}/$jobname" );
+	my %archives;
+	if( $dir ) {
+		my $af;
+		while( defined ($af=readdir(DIR)) ) {
+			next if not $af =~ /^(scheduled|hourly|daily|weekly|monthly|yearly])\.[0-9]+$/;
+			(my $k, my $b)=split(/\./, $af);
+			$k =~ s/scheduled/A/; $k =~ s/daily/B/; $k =~ s/weekly/C/; $k =~ s/monthly/D/; $k =~ s/yearly/E/;
+			$archives{"$k".sprintf("%05d",$b)}=$af;
+		}
+	}
+	print "Job '$jobname' has the following archives:\n";
+	foreach my $k ( sort keys %archives ) {
+		print "  $archives{$k}\n";
+	}
+	print "WARNING: All archives and logfiles of the job '$jobname' will be deleted!\n";
+	my $input='';
+	print "Type 'proceed' to confirm or <ENTER> to cancel: ";
+	$input = lc(<STDIN>);
+	chomp( $input );
+	if( $input ne 'proceed' ) {
+		affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+	}
+	rewriteConfigVal($jobname,'status','disabled');
+	print( "Set job '$jobname' status disabled.\n");
+
+#####################################################################################################################################
+############début modifs
+	if ($job{'remoteHostName'} ne 'localhost')
+	{
+############ fin modifs (penser à l'accolade fermante après le revokeKeys
+#################################################################################################################################
+	revokeKeys($jobname);
+	}
+	
+	if( $dir ) {
+		print "deleting $job{'RootDir'}/$jobname in background..."; $|++;
+		removeDir("$job{'RootDir'}/$jobname",1);
+		print " Done.\n";
+	}
+	cronSetup();
+	print "deleting logfile '/var/log/affa/$jobname.log' ... "; $|++;
+	unlink("/var/log/affa/$jobname.log");
+	print " Done.\n";
+}
+
+sub	fullRestore() {
+	$interactive=0;
+	$SIG{'INT'} = sub{};
+	my $jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $archive=$ARGV[1]||'scheduled.0';
+	my $txt;
+	my @cmd;
+
+	if( not $cfg->SectionExists($jobname) ) { 
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+
+	if( $job{'AutomountDevice'} and $job{'AutomountPoint'} ) {
+		mount( $job{'AutomountDevice'},  $job{'AutomountPoint'}, $job{'AutomountOptions'} );
+	}
+
+	# check if a job is running
+	if( getLock($jobname) ) {
+		print "Job '$jobname' is running. Wait for completion. Then run affa --full-restore again.\n";
+		affaErrorExit( "affa job 'jobname'  is running." );
+	}
+
+	# check if archive exists
+	checkArchiveExists($jobname,$archive); # and affaErrorExit() if archive does not exist
+	$interactive=1;
+	checkConnection($jobname);
+
+	###################################################################################################################################
+	########## debut des modifs
+	print "WARNING: After the restore is done, the server $job{'remoteHostName'} will reboot! \n" if $job{'SMEServer'} ne 'no';
+	######### fin des modifs
+	###################################################################################################################################
+
+
+	my $input='';
+	print "Type 'proceed' to confirm or <ENTER> to cancel: ";
+	$input = lc(<STDIN>);
+	chomp( $input );
+	if( $input ne 'proceed' ) {
+		$interactive=0;
+		affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+	}
+
+	###################################################################################################################################
+        ########## debut des modifs
+        
+	if ($job{'SMEServer'} ne 'no')
+        {
+		print 'SME-server= ' . $job{'SMEServer'} . "\n";
+		my $prerestore='SME/signal-pre-restore';
+		if ($job{'remoteHostName'} eq 'localhost')
+			{
+			execJobCommand($jobname,$prerestore);
+			}
+		else
+			{
+			execJobCommandRemote($jobname,$prerestore);
+			}	
+	        print 'pre-restore: $prerestore' . "\n";
+        }
+
+
+        ######### fin des modifs
+        ###################################################################################################################################
+
+
+	my @SourceDirs =  getSourceDirs($jobname);
+	foreach my $k (@SourceDirs) {
+		my $src = "$job{'RootDir'}/$jobname/$archive/$k";
+		next if not -e $src;
+		$txt="Restoring $job{'remoteHostName'}:$k ..."; lg( $txt ); print "$txt\n";
+		@cmd=(
+			"/usr/bin/rsync",
+			"--archive",
+			"--stats",
+			"--ignore-errors", 
+			$opts{'preserve-newer'}||'yes' eq 'no' ? "" : "--update",
+			$opts{'delete'}||'no' eq 'yes' ? "--delete-during" : "",
+			"--partial",
+			$job{'rsync--inplace'} ne 'no' ? "--inplace" : "",
+			"--numeric-ids",
+			"--rsh=\"$job{'localSSHBinary'} $job{'_sshOpts'}\"",
+			(-d $src ? "$src/" : "$src"),
+			$job{'remoteHostName'} eq 'localhost' ? "/$k" : $job{'remoteUser'}.'@'.$job{'remoteHostName'}.":/$k"
+			);
+
+#######################################################################################################################################
+####################### debut des modifs faites dans la dernière ligne de la commande @cmd précédente
+#
+#
+#        ajout de              	$job{'remoteHostName'} eq 'localhost' ? ":/$k" : 
+#
+######################### fin des modifs
+##########################################################################################################################################
+		ExecCmd( @cmd, 0 );
+	}
+
+	###################################################################################################################################
+        ########## debut des modifs
+
+        if ($job{'SMEServer'} ne 'no')
+        	{
+		
+#####################################################################################################
+################################## penser à rajouter le imapIndexFilesDelete();     cf AffaV2
+
+
+print 'SME-server= ' . $job{'SMEServer'} . "\n";
+	        my $postupgrade='SME/signal-post-upgrade-reboot';
+		if ($job{'remoteHostName'} eq 'localhost')
+			{
+			execJobCommand($jobname,$postupgrade);
+			}
+		else
+			{
+			execJobCommandRemote($jobname,$postupgrade);
+			}
+		print 'post-upgrade + reboot: $postupgrade' . "\n";       
+ 	
+	        }
+
+
+        ######### fin des modifs
+        ###################################################################################################################################
+
+
+
+
+
+
+
+}
+
+sub resumeInterrupted() {
+	my @csv = getStatusRaw();
+	my $delay=15;
+	foreach my $line (@csv) {
+		my @c=split(";", $line );
+		if( $c[9] && $c[9] =~ 'interrupted' ) {
+			my $jobname=$c[0];
+			my %job=getJobConfig($jobname);
+			my $txt="Interrupted Affa job '$jobname' ";
+			if( $job{'resumeAfterBoot'} eq 'yes' ) {
+				system( "/sbin/affa --run --_delay=$delay $jobname &");
+				$txt.="resumed. Start is delayed by $delay seconds.";
+				$delay+=30;
+			} else {
+				$txt.="was NOT resumed.";
+			}
+			lg($txt);
+			print "$txt\n";
+		}
+	}
+}
+
+sub sendKeys() {
+	$interactive=1;
+	@ARGV = getJobs() if not $ARGV[0];
+	foreach my $jobname (@ARGV ) {
+		$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+		my $kf="/root/.ssh/id_dsa.pub";
+		my $s;
+		my @cmd;
+		if( not $cfg->SectionExists($jobname) ) { 
+			my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+			affaErrorExit( "$txt" );
+		}
+		my %job=getJobConfig($jobname);
+		print "Job $jobname: " if( $jobname );
+		if( not -f $kf or not -f "/root/.ssh/id_dsa" ) {
+			$s="Generating DSA keys...";
+			print "$s\n"; lg($s);
+			@cmd=("/usr/bin/ssh-keygen","-t","dsa","-N ''","-f", "/root/.ssh/id_dsa" );
+			not ExecCmd( @cmd, 0 ) or affaErrorExit( "Couldn't generate DSA keys" );
+			$s="Successfully created DSA key pair.";
+			print "$s\n"; lg($s);
+		}
+		open( PUBK, $kf ) or affaErrorExit( "Could not open $kf" );
+		my $pubk=trim(<PUBK>);
+		close( PUBK );
+		unlink  "/root/.ssh/knownhosts-$jobname";
+		my $ak = $job{'RemoteAuthorizedKeysFile'};
+		(my $kd=$ak)=~s/(.*?)\/.*/$1/;
+		my $mkdirstr=$kd?"mkdir -p $kd && chmod 700 $kd &&":'';
+		my $cmd="/bin/cat $kf | /usr/bin/ssh $job{'_sshOpts'} -q $job{'remoteUser'}\@$job{'remoteHostName'} 'cat - > /tmp/$SystemName.\$\$ && $mkdirstr touch $ak && grep -v \"$pubk\" < $ak >> /tmp/$SystemName.\$\$ ; mv -f /tmp/$SystemName.\$\$ $ak'"; 
+		dbg( "Exec Cmd: $cmd" );
+		my $err=system($cmd);
+		$s = $err ? "Sending public key to $job{'remoteHostName'} failed." : "Public key sent to $job{'remoteHostName'}";
+		print "$s\n"; lg($s);
+	}
+}
+
+sub revokeKeys($) {
+	my $jobname=shift;
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $kf="/root/.ssh/id_dsa.pub";
+	return if not -f $kf;
+	my $s;
+	my @cmd;
+	if( not $cfg->SectionExists($jobname) ) { # does job exist?  
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig($jobname);
+	open( PUBK, $kf ) or affaErrorExit( "Could not open $kf" );
+	my $pubk=trim(<PUBK>);
+	close( PUBK );
+	my $ak = $job{'RemoteAuthorizedKeysFile'};
+	my $cmd="/usr/bin/ssh $job{'_sshOpts'} -q -o PasswordAuthentication=no -o StrictHostKeyChecking=yes $job{'remoteUser'}\@$job{'remoteHostName'} 'touch $ak && grep -v \"$pubk\" < $ak > $ak.$SystemName.\$\$ ; mv -f $ak.$SystemName.\$\$ $ak'";
+	dbg( "Exec Cmd: $cmd" );
+	my $err=system($cmd);
+	if( $err ) {
+		$s="Deleting public key on $job{'remoteHostName'} failed.";
+		print "$s\n";
+		affaErrorExit( $s );
+	}
+	unlink  "/root/.ssh/knownhosts-$jobname";
+	$s="Public key deleted on $job{'remoteHostName'}";
+	print "$s\n"; lg($s);
+}
+
+sub checkConnectionsAll() {
+	@ARGV = getJobs() if not $ARGV[0];
+	foreach my $jb( sort @ARGV ) {
+		next if $jb eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jb);
+		my @cmd;
+		printf "%-16s : ", $jb;
+		if( $job{'_rsyncd'} ) {
+			print "Rsyncd connection ";
+			@cmd=($job{'_rsyncLocal'}, '-dq', ($job{'rsyncdUser'} ? $job{'rsyncdUser'}.'@' : '') . $job{'remoteHostName'} . "::'" . $job{'rsyncdModule'} . "'");
+			print( ((ExecCmd( @cmd, 0 )==0) ? "ok" : "FAILED") . ". " );
+		}
+		print "SSH connection ";
+		@cmd=('/usr/bin/ssh', '-p', $job{'sshPort'}, '-o', "HostKeyAlias=$jb", '-o', 'StrictHostKeyChecking=yes', '-o', "ConnectTimeout=$job{'ConnectionCheckTimeout'}",'-o','PasswordAuthentication=no', $job{'_sshOpts'}, $job{'remoteUser'}.'@'.$job{'remoteHostName'},'echo OK');
+		ExecCmd( @cmd,0); chomp($ExecCmdOutout);
+		print ($ExecCmdOutout eq "OK" ? "ok\n" : "FAILED\n");
+	}
+}
+
+sub showProperty() {
+	exit if not $ARGV[0];
+	my $pa=$ARGV[0];
+	my $prop='';
+	my $cnt=0;
+	my %def=getDefaultConfig();
+	for my $p (sort keys %def) {
+		next if $p=~/^_/;
+		if( $p =~ /^$pa/i ) {
+			if( $p =~ /^$pa$/i ) {
+				$prop=$p;
+				last;
+			}
+			$prop.=" " if $cnt;
+			$prop.=$p; 
+			$cnt++;
+		}
+	}
+	exit if not $prop;
+	if( $cnt>1 ) {
+		print "$pa is ambiguous: $prop\n";
+		exit;
+	}
+	print "Values of property $prop\n";
+
+	my $jobcolw=17;
+	my %multi=getMultivalueKeys();
+	my @sections= $cfg->Sections();
+	foreach my $jobname( sort @sections ) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+		my $jn  = length($jobname)>$jobcolw ? substr($jobname,0,$jobcolw-2).".." : $jobname;
+		if( $multi{$prop} ) {
+			my @v=@{$job{$prop}};
+			my $out='';
+			foreach my $p ( sort @v ) {
+				if( $prop=~/(TimeSchedule|SambaValidUser)/ ) {
+					$out.= $out ? " $p" : sprintf( "%-".$jobcolw."s: %s", $jn, $p );
+				} else {
+					$out.=sprintf( "%-".$jobcolw."s: %s\n", $jn, $p );
+				}
+			}
+			$out=~s/\n$//;
+			print "$out\n" if $out;
+		} else {
+			printf( "%-".$jobcolw."s: %s\n", $jn, $job{$prop} );
+		}
+	}
+}
+
+sub showConfigPathes() {
+	$interactive=1;
+	my @csv = showConfigPathesRaw();
+	my $out = "$affaTitle\n";
+	if( $opts{'csv'} ) {
+		print join( "\n", @csv ) .  "\n";
+	} else {
+		shift(@csv);
+		my $jobcolw=2;
+		foreach my $k (@csv) {
+			my @c=split(";", $k );
+			$jobcolw = length($c[0]) if $jobcolw<length($c[0]);
+		}
+		$jobcolw=3 if( $jobcolw<3 );
+		$jobcolw=17 if( $jobcolw>17 );
+		foreach my $k (sort @csv) {
+			(my $job, my $configpath)=split(";",$k);
+			$job = length($job)>$jobcolw ? substr($job,0,$jobcolw-2).".." : $job;
+			printf( "%-".$jobcolw."s: %s\n", $job, $configpath);
+		}
+	}
+}
+sub showConfigPathesRaw() {
+	my @ret;
+	push(@ret,"job;configpath");
+
+	if( not $ARGV[0] )
+		{
+		foreach my $job( sort $cfg->Sections() )
+			{
+			next if $job eq 'GlobalAffaConfig';
+			push( @ARGV, $job );
+			}
+		}
+
+	foreach my $j (sort @ARGV) {
+		my $c=openOrgConfig($j);
+		push(@ret,"$j;".$c->GetFileName());
+	}
+	return @ret;
+}
+
+sub logTail(){
+	my $txt;
+	my $jobname=$ARGV[0]||'';
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	my $log;
+	if( not $jobname ) {
+		$log=$logfile; # global log
+	} else {
+		$log="$logdir/$jobname.log";
+	}
+	if( not -f $log) {
+		$txt= "Error: Job log file not found."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	open( LF, $log );
+	my $lc=0;
+	while( <LF> && $lc<50 ) {
+		$lc++;
+	}
+	close(LF);
+	print "\nHit Ctrl-C to exit\n";
+	sleep(1);
+	if( $lc<50 ) { #current log file is too short
+		my $pl=`ls -r $log-* 2>/dev/null | head -1`;
+		system("tail -50 $pl") if $pl; # show last rotated log file
+	}
+	system("tail -n 50 -f $log");
+}
+
+sub showSchedule() {
+	my $res=$opts{15} ? 15 : 30;
+	my $vt=240/30*$res;
+	my %out;
+	my $maxlen=0;
+	my $disabled=0;
+	my @cols;
+	for( my $i=0,my $h=12*60; $i<24*60; $i+=$res, $h+=$res ) {
+		$h=0 if $h >= 24*60;
+		push( @cols, $h);
+	}
+	foreach my $jobname( sort $cfg->Sections() ) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+		if( $job{'status'} ne "enabled" && not $opts{'all'} ) {
+			$disabled++;
+			next;
+		}
+		my $rpt;
+		my $rptfile=$job{'RootDir'}."/$jobname/scheduled.0/.AFFA3-REPORT";
+		if( -f $rptfile ) {
+			$rpt=Config::IniFiles->new( -file => $rptfile );
+		}
+		my $ExecTime = $rpt ? $rpt->val('Report','ExecutionTime') : 0;
+		$ExecTime=int($ExecTime/60);
+		my $end = $rpt ? $rpt->val('Report','Date') : '0000';
+		$end =~ /.*(..)(..)$/;
+		$end=$1*60+$2;
+		my $pid=getLock($jobname);
+		my $dedup = $rpt && $rpt->exists('Report','DedupDate') ? 1 : 0;
+		my $ddend='0000';
+		if( !$dedup ) {
+			if( $job{'dedup'} && $job{'dedup'} eq 'yes' && $pid && findProcessId($pid,$dedupBinary)) {
+				$ddend=Date::Format::time2str("%Y%m%d%H%M",time());
+				$dedup=1;
+			}
+		} else {
+			$ddend = $rpt->val('Report','DedupDate');
+		}
+		$ddend =~ /.*(..)(..)$/;
+		$ddend=$1*60+$2;
+		my $ddstart=$end;
+		my $start = $end-$ExecTime;
+		while( $start<0 ) {$start+=1440};
+		my ($s1, $e1, $s2, $e2);
+		if( $start>$end ) {
+			$s1=0; $e1=$end; $s2=$start; $e2=1440;
+		} else {
+			$s1=$s2=$start; $e1=$e2=$end;
+		}
+		my ($ds1, $de1, $ds2, $de2);
+		if( $ddstart>$ddend ) {
+			$ds1=0; $de1=$ddend; $ds2=$ddstart; $de2=1440;
+		} else {
+			$ds1=$ds2=$ddstart; $de1=$de2=$ddend;
+		}
+		my $jn = substr( $jobname, 0, 26);
+		$maxlen=length($jn) if length($jn) > $maxlen;
+		# Time Schedule
+		my @ts = sort $cfg->val($jobname,'TimeSchedule');
+		for( my $i=0; $i<@ts; $i++ ) {
+			$ts[$i] =~ /(..)(..)/;
+			$ts[$i] = $1*60+$2;
+		}
+		# Kill at
+		my $killat=-1;
+		if( $job{'killAt'} ) {
+			$job{'killAt'}  =~ /(..)(..)/;
+			$killat=$1*60+$2;
+		}
+
+		# Resume at
+		my $resumeat=-1;
+		if( $job{'resumeKilledAt'} ) {
+			$job{'resumeKilledAt'}  =~ /(..)(..)/;
+			$resumeat=$1*60+$2;
+		}
+
+		my $t=shift @ts if @ts;
+		for my $i (@cols) {
+			$out{$jn}.=" " if $i%$vt == 0;
+			if( $killat >= $i && $killat < $i+$res ) {
+				$out{$jn}.="K";
+			} elsif( $resumeat >= $i && $resumeat < $i+$res ) {
+				$out{$jn}.="R";
+			} elsif( $t >= $i && $t < $i+$res ) {
+				$out{$jn}.="S";
+				while( @ts && $t < $i+$res ) {
+					$t=shift @ts;
+				}
+			} elsif( $i >= $s1 && $i< $e1 or $i >= $s2 && $i< $e2 ) {
+				$out{$jn}.="=";
+			} elsif( $dedup && ($i >= $ds1 && $i< $de1 or $i >= $ds2 && $i< $de2) ) {
+				$out{$jn}.="~";
+			} else {
+				$out{$jn}.="-";
+			}
+		}
+		$out{$jn} .= " busy" if $pid;
+		$out{$jn}.=sprintf "\n";
+	}
+	print "$affaTitle\n";
+	if( %out ) {
+		printf "%" . $maxlen . "s", "TIME";
+		for my $i (@cols) {
+			my $h = int($i/60);
+			my $m = sprintf "%02d", $i-$h*60;
+			printf " %-8s", "$h:$m" if $i%$vt == 0;
+		}
+		print "\n";
+		foreach my $k (sort {index($out{$a},'S') cmp index($out{$b},'S') } keys %out ) {
+			printf "%" . $maxlen . "s%s",  $k, $out{$k};
+		}
+	}
+	printf "Symbols: S=scheduled K=kill R=resume '='=rsync '~'=dedup\n";
+	printf "%d disabled jobs not listed. Use --all to display.\n", $disabled if $disabled;
+}
+
+
+sub sendStatus() {
+	if( $job{'sendStatus'}||'' =~ /^(daily|weekly|monthly)$/ ) {
+		$job{'sendStatus'} = ucfirst( $job{'sendStatus'} );
+		my $msg = new Mail::Send;
+		$msg->subject("$job{'sendStatus'} status from Affa server $hostname");
+		$msg->to($job{'_EmailAddress'});
+		$msg->set("From", "\"Affa Server $hostname\" <noreply\@$Domain>");
+		my $fh = $msg->open;
+		print $fh "Status:\n";
+		print $fh getStatus();
+		print $fh "\nDisk Usage:\n";
+		print $fh DiskUsage();
+		print $fh "\nArchive lists of all jobs:\n";
+		print $fh listArchives();
+		print $fh "\ngenerated on " .Date::Format::ctime(time());
+		$fh->close; 
+		lg( "$job{'sendStatus'} status message sent to " . $job{'_EmailAddress'} );
+	}
+}
+
+sub mailTest() {
+	my $jobname=$ARGV[0]||'';
+	if( not $cfg->SectionExists($jobname) ) {
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig( $jobname );
+	my $msg = new Mail::Send;
+	$msg->subject("Testmail from job '$jobname' on Affa server $hostname");
+	$msg->to($job{'_EmailAddress'});
+	$msg->set("From", "\"Affa Server $hostname\" <noreply\@$Domain>");
+	my $fh = $msg->open;
+	print $fh "It works!\n\n";
+	$fh->close; 
+	foreach my $k (@{$job{'EmailAddress'}}) {
+		my $txt="Testmail sent to $k";
+		lg( $txt); print "$txt\n";
+	}
+#####################################################################################################################
+########################################### début des modifs: copié à partir de Affa V2 et ajouté "$jobname" à mailTestWatchdogRemote();
+	if( $job{'Watchdog'} eq 'yes' and $job{'remoteHostName'} ne 'localhost' )	
+		{
+		mailTestWatchdogRemote($jobname);
+		my $txt="Watchdog testmail from $job{'remoteHostName'} sent to " . $job{'_EmailAddress'};
+		lg( $txt); print "$txt\n";
+		}
+######################################### fin des modifs
+#######################################################################################################################
+	
+}
+
+sub setupSamba() {
+	lg( "Configuring Samba");
+	if( not -f $SambaStartScript ) {
+		lg( "Samba service is not installed or not properly configured." );
+		return;
+	}
+	my %inc;
+	foreach my $jobname ($cfg->Sections()) {
+		next if $jobname eq 'GlobalAffaConfig';
+		my %job=getJobConfig($jobname);
+		if( not $job{'_SambaValidUser'} and $job{'SambaShare'} eq 'yes' ) {
+			lg( "Job $jobname: No Valid Users defined. Samba has been access disabled." );
+		}
+		my $affasmb="/etc/samba/Affa-Job-$jobname.conf";
+		if( $job{'SambaShare'} eq 'yes' and $job{'_SambaValidUser'} ) {
+			open( FD, ">$affasmb") or affaErrorExit("Could not create $affasmb");
+			print FD "[$jobname]\n";
+			print FD "path = $job{'RootDir'}/$jobname\n";
+			print FD "comment = Affa archive: $job{'Description'}\n";
+			print FD "valid users = $job{'_SambaValidUser'}\n";
+			print FD "force user = root\n";
+			print FD "read only = yes\n";
+			print FD "writable = no\n";
+			print FD "veto files = /.$jobname-setup.ini/,/.doneDates/,/.AFFA3-REPORT/,/.AFFA-REPORT/.AFFA-TRASH/\n\n";
+			close(FD);
+			$inc{"include = $affasmb"}=1;
+		} else {
+			unlink( $affasmb );
+		}
+	}
+
+	open( FD, "<$smbconf") or affaErrorExit("Could not open $smbconf");
+	open( FW, ">$smbconf.$$") or affaErrorExit("Could not create $smbconf.$$");
+	while( <FD> ) {
+		$_=trim($_);
+		if( $_ =~ /include = (\/etc\/samba\/Affa-Job.*conf)/ and not $inc{$_} ) {
+			unlink $1;
+		}
+		print FW "$_\n" if not $_ =~ /(include = \/etc\/samba\/Affa-Job|# Affa archives. Updated on)/;
+		if( $_ =~ /^\[global\]$/i ) {
+			printf FW "# Affa archives. Updated on " .formatHTime(Date::Format::time2str("%Y%m%d%H%M",time())) . "\n";
+			print FW join("\n", sort keys %inc)."\n";
+		}
+	}
+	close(FD);
+	close(FW);
+
+	rename( "$smbconf.$$", "$smbconf") or affaErrorExit("Moving $smbconf.$$ to $smbconf failed");
+	my @cmd=($SambaStartScript,'reload');
+	ExecCmd( @cmd, 0); # Reload Samba config
+}
+
+sub sendErrorMesssage() {
+	return if not $jobname or not $Command;
+	my %job;
+	if( $cfg->SectionExists($jobname) ) {
+		%job=getJobConfig($jobname);
+	}
+	return if not $job{'_EmailAddress'};
+	my $msg = new Mail::Send;
+	$msg->subject("Error on Affa server $hostname: Job '$jobname' failed.");
+	$msg->to($job{'_EmailAddress'});
+	$msg->set("From", "\"Affa Server $hostname\" <noreply\@$Domain>");
+	my $fh = $msg->open;
+	print $fh "Excerpt from log file $logfile:\n";
+	foreach my $k (@Messages) {
+		chomp($k);
+		$k =~ s/ /_/g;
+		print $fh "$k\n";
+	}
+	$fh->close; 
+	lg( "Failure message sent to " . $job{'_EmailAddress'} );
+}
+
+sub sendSuccessMesssage() {
+	return if not $jobname or $Command ne "scheduled" or not $job{'_EmailAddress'} or ($job{'chattyOnSuccess'}||0)<=0;
+	if( $job{'chattyOnSuccess'} > 0 ) {
+		$job{'chattyOnSuccess'}-- ;
+		my $err=rewriteConfigVal($jobname,'chattyOnSuccess',$job{'chattyOnSuccess'});
+		dbg("Decremented 'chattyOnSuccess' value to $job{'chattyOnSuccess'} in config file of job '$jobname'") if( not $err );
+	}
+	my $msg = new Mail::Send;
+	$msg->subject("Success on Affa server $hostname: Job '$jobname' completed.");
+	$msg->to($job{'_EmailAddress'});
+	$msg->set("From", "\"Affa Server $hostname\" <noreply\@$Domain>");
+	my $fh = $msg->open;
+	print $fh "Affa job '$jobname' successfully completed.\n\n";
+	print $fh listArchives() . "\n";
+	print $fh "\nDisk Usage:\n";
+	print $fh DiskUsage();
+	print $fh "\nYou will receive " . ($job{'chattyOnSuccess'}?$job{'chattyOnSuccess'}:'no') . " further success notifications.\n";
+	$fh->close; 
+	lg( "Success message sent to " . $job{'_EmailAddress'} );
+}
+
+sub cronSetup() {
+	my $md5 = Digest::MD5->new;
+	my $mt=-M '/etc/cron.d/affa';
+	foreach my $s (getConfigFileList()) {
+		$mt=-M $s if $mt > -M $s;
+		$md5->add($s);
+	}
+	open(IN,"</etc/cron.d/affa");
+	(my $md5x=<IN>)=~s/.*MD5:(.*)$/$1/;
+	chomp($md5x);
+	close(IN);
+	my $md5n=$md5->hexdigest;
+	return if ($md5x eq $md5n) && ($mt >= -M '/etc/cron.d/affa');
+	my @sects=$cfg->Sections();
+	open(CF,">/tmp/affa.$$.$curtime");
+	printf CF "# updated on " .formatHTime(Date::Format::time2str("%Y%m%d%H%M",time())) . " MD5:" . $md5n ."\n\n";
+	foreach my $j (sort @sects) {
+		next if( $j eq "GlobalAffaConfig");
+		my %job=getJobConfig($j);
+		if( $job{'status'} eq 'enabled' ) {
+			print CF "# Job $j; $job{'remoteHostName'}, $job{'Description'}\n"; 
+			for my $t (sort @{$job{'TimeSchedule'}}) {
+				$t=~/(\d\d)(\d\d)/;
+				printf CF "%02d %02d * * * root %s --silent --run %s\n",$2,$1,'/sbin/affa',$j;
+			}
+			if( $job{'killAt'} ) {
+				(my $t=$job{'killAt'})=~/(\d\d)(\d\d)/;
+				my $nt=3600*$1+60*$2;
+				my $r='';
+				if( $job{'resumeKilledAt'} ) {
+					$job{'resumeKilledAt'}=~/(\d\d)(\d\d)/;
+					my $sec=(3600*$1+60*$2)-$nt;
+					$sec = $sec<=0 ? $sec+=86400 : $sec;
+					$r = "--resume=$sec";
+				}
+				printf CF "%02d %02d * * * root %s --silent --kill %s %s\n",$2,$1,'/sbin/affa',$r,$j;
+			}
+		} else {
+			print CF "# DISABLED Job $j; $job{'remoteHostName'}, $job{'Description'}\n"; 
+		}
+		print CF "\n";
+	}
+	my %job=getJobConfig('');
+	print CF "# Send status\n";
+	if( $job{'sendStatus'} =~ /(daily|weekly|monthly)/ ) {
+		print CF "00 5 * * *" if $job{'sendStatus'} eq 'daily';
+		print CF "00 5 * * 0" if $job{'sendStatus'} eq 'weekly';
+		print CF "00 5 1 * *" if $job{'sendStatus'} eq 'monthly';
+		print CF " root /sbin/affa --silent --send-status\n\n";
+	}
+	print CF "# update this file if needed\n";
+	print CF "*/15 * * * * root /sbin/affa --silent --_cronupdate\n\n";
+	close(CF);
+	move( "/tmp/affa.$$.$curtime", "/etc/cron.d/affa");
+	lg( "/etc/cron.d/affa updated" );
+	setupSamba();
+}
+
+sub moveFileorDir($$) {
+	(my $src, my $dst)=@_;
+	return if not -e $src;
+	dbg( "Moving $src to $dst" );
+	move( $src, $dst) or affaErrorExit("Moving $src to $dst failed");
+}
+
+sub removeDir($$) {
+	(my $dir, my $bg) = @_;
+	return if( not -d $dir );
+	$bg = $bg ? '&' : '';
+	dbg( "Deleting $dir" );
+	# after the first rm run, do a chmod 777 and run rm again. This delete files with wrong permissions.
+	# This is an issue on mounted CIFS filesystems.
+	#my @cmd=('/bin/rm', '-rf', $dir, ';', '/bin/chmod', '-R', '777', "$dir/*", '&>', '/dev/null', ';', '/bin/rm', '-rf', $dir );
+	my @cmd=("(/bin/rm -rf $dir;/bin/chmod -R 777 $dir/*;/bin/rm -rf $dir) &>/dev/null $bg" );
+	ExecCmd( @cmd, 0 );
+}
+
+sub remoteCopy($$$) {
+	(my $jobname, my $src, my $dst) = @_;
+	my %job=getJobConfig($jobname);
+	my @cmd=(
+		$job{'_rsyncLocal'}, 
+		"--archive",
+		$job{'BandwidthLimit'} ? "--bwlimit=$job{'BandwidthLimit'}" : '',
+		$job{'rsync--modify-window'} > 0 ? "--modify-window=$job{'rsync--modify-window'}" : '',
+		$job{'rsyncTimeout'} ? "--timeout=$job{'rsyncTimeout'}" : "",
+		$job{'rsyncCompress'} eq 'yes' ? "--compress" : "",
+		"--rsync-path=\"$job{'_rsyncRemote'}\"",
+		"--rsh=\"$job{'localSSHBinary'} $job{'_sshOpts'}\"",
+		$src, $job{'remoteUser'}.'@'.$job{'remoteHostName'}.":$dst" );
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "Couldn't copy $src to remote host." );
+}
+
+sub showVersion() {
+	print "$affaTitle\n";
+	printf " Samba service is%s installed.\n", -f $SambaStartScript ? '' : ' NOT';
+	printf " NRPE service is%s installed.\n", -f $NRPEStartScript ? '' : ' NOT';
+	printf " Freedup program is%s installed.\n", -x $dedupBinary ? '' : ' NOT';
+}
+
+sub showTextfile($) {
+	my $f=shift;
+	if( not -f $f) {
+		print "File $f not found.\n";
+		exit -1;
+	}
+	open(FI,"<$f");
+	while( <FI>) {
+		print $_;
+	}
+}
+
+sub showHelp($) {
+	my $short = shift;
+	if( not $short ) {
+		print "$affaTitle\n";
+		print "Affa is a rsync based backup program for Linux.\n";
+		print "It remotely backups Linux or other systems, which have either the rsync\n";
+		print "program and the sshd service or the rsyncd service installed.\n";
+		print "Please see http://affa.sf.net for full documentation.\n";
+		print "\n";
+		print "Copyright (C) 2004-2012 by Michael Weinberger\n";
+		print "This program comes with ABSOLUTELY NO WARRANTY; for details type 'affa --warranty'.\n";
+		print "This is free software, and you are welcome to redistribute it\n";
+		print "under certain conditions; type 'affa --license' for details.\n";
+		print "\n";
+	}
+	print "Usage: affa --run JOB\n";
+	print "  or   affa --configcheck\n";
+	print "  or   affa --make-cronjobs\n";
+	print "  or   affa --send-key [JOB]\n";
+	print "  or   affa --check-connections [JOB JOB ...]\n";
+	print "  or   affa --resume-interrupted\n";
+	print "  or   affa --full-restore [--preserve-newer=no] [--delete=yes] JOB [ARCHIVE]\n";
+	print "  or   affa --list-archives [--csv] [JOB JOB ...]\n";
+	print "  or   affa --status [--csv]\n";
+	print "  or   affa --show-config-pathes [--csv] [JOB JOB ...]\n";
+	print "  or   affa --show-default-config\n";
+	print "  or   affa --show-schedule [-15]\n";
+	print "  or   affa --show-property PROPERTY\n";
+	print "  or   affa --log-tail [JOB]\n";
+	print "  or   affa --send-status\n";
+	print "  or   affa --disk-usage [--csv]\n";
+	print "  or   affa --cleanup JOB\n";
+	print "  or   affa --rename-job JOB NEWNAME\n";
+	print "  or   affa --move-archive JOB NEWROOTDIR\n";
+	print "  or   affa --delete-job JOB\n";
+	print "  or   affa --revoke-key JOB\n";
+	print "  or   affa --kill JOB\n";
+	print "  or   affa --killall\n";
+	print "  or   affa --mailtest JOB\n";
+	print "  or   affa --nrpe [JOB JOB ...]\n";
+	print "  or   affa --init-nrpe\n";
+	print "  or   affa --version\n";
+	print "  or   affa --warranty\n";
+	print "  or   affa --license\n";
+	print "  or   affa --help\n";
+}
+
+sub SignalHandler() {
+	my $sig=shift;
+	killProcessGroup(0,$sig);
+}
+
+sub killall() {
+	foreach my $job (sort $cfg->Sections() ) {
+		next if $job eq 'GlobalAffaConfig';
+		killJob($job);
+	}
+}
+
+sub killJob($) {
+	$jobname=shift;
+	$jobname =~ /([a-z0-9_\.-]*)/i; $jobname = $1; # untaint
+	$allow_retry=0;
+	if( not $cfg->SectionExists($jobname) ) {
+		my $txt= "Error: Job '$jobname' undefined."; print("$txt\n");
+		affaErrorExit( "$txt" );
+	}
+	my %job=getJobConfig($jobname);
+	my $pid=getLock($jobname);
+	if( $pid ) {
+		if( $opts{'all'} || $job{'dedupKill'} eq 'yes' || !findProcessId($pid,$dedupBinary) ) {
+			killProcessGroup($pid, 'TERM');
+			print "Affa job $jobname killed (pid=$pid)\n" if not $opts{'silent'};
+			my $resume= $opts{'resume'};
+			if( $resume ) {
+				system("/sbin/affa --run --_delay=$resume $jobname &");
+			} 
+		} else {
+			print "Deduplication still running. Job $jobname was not killed. Use --all to force kill.\n" if not $opts{'silent'};
+		}
+	}
+}
+
+sub killProcessGroup($$) {
+	(my $pid, my $sig) = @_;
+	$allow_retry=0;
+	$SIG{'TERM'} = sub{};
+	my $pgrp=getpgrp($pid);
+	kill 'TERM', -$pgrp;
+	if( $pid == 0 ) { # current process
+		lg("$Command run killed");
+		if( $Command eq "scheduled" ) {
+			affaErrorExit( "Caught interrupt signal $sig");
+		} else {
+			exit -1;
+		}
+	}
+}
+
+sub affaErrorExit($) {
+	(my $msg) = @_;
+	my $package=(caller)[0];
+	my $err=(caller)[2];
+	my $sub=(caller(1))[3]||'';
+	my $txt="Error ($err): $msg";
+	lg( $txt );
+	print "$txt\n" if $interactive==1;
+	unmountAll();
+	my $retry = ( defined $opts{'RetryAttempts'} ? $opts{'RetryAttempts'} : $job{'RetryAttempts'}) - 1;
+	my $retryCmd='';
+	if( $allow_retry && $retry>=0 && ($Command eq 'scheduled') ) {
+		my $sleep=$opts{'RetryAfter'}||($job{'RetryAfter'})||0;
+		$sleep = 0 if $sleep<0;
+		$retry = int(86400/$sleep)-1 if $retry*$sleep>86400; 
+		$retryCmd="/sbin/affa --run $jobname --RetryAttempts=$retry --RetryAfter=$sleep &";
+		lg( "Starting re-run " . ($job{'RetryAttempts'}-$retry) . " of $job{'RetryAttempts'} in $job{'RetryAfter'} seconds.");
+	}
+	lg( "Total execution time: " . timeUnit(time()-$StartTime) ) if $StartTime;
+	sendErrorMesssage() if not $retryCmd or not $allow_retry or ($job{'RetryNotification'}||'') eq 'yes';
+	removeLock();
+
+#################################################################################################################################################
+###################################################### début modifs ajouté comme dans Affa2
+	startServices() if $ServicesStopped;
+###################################################### fin modifs
+####################################################################################################################################################
+
+	lg( "Exiting." );
+	lg( '.' );
+	system("sleep 3 && $retryCmd") if $retryCmd;	
+	exit -1;
+}
+
+sub affaExit( $ ) {
+	my $msg = shift(@_);
+	unmountAll();
+	lg( $msg );
+	removeLock();
+	lg( "Total execution time: " . timeUnit(time()-$StartTime) ) if $StartTime;
+	lg( "Exiting." );
+	lg( '.' );
+	exit 0;
+}
+
+###
+
+sub setlog( $ ) {
+	my $s=shift;
+	$logfile = "$logdir/$s";
+}
+
+sub lg( $ ) {
+	if( $runninglog ) {
+		my $txt=$runninglog;
+		$runninglog='';
+		lg($txt);
+	}
+	my $str	= shift(@_);
+	chomp($str);
+	if (defined($logfile))	{
+		if( $interrupt ) {
+			my $txt=$interrupt;
+			$interrupt='';
+			lg( $txt ) 
+		}
+		open( LOG, ">> $logfile") or die "Error: Couldn't open logfile $logfile for writing\n";
+		my $tag = Date::Format::time2str("%a %b %e %T",time()) . "[$process_id]:";
+		$tag .= "  " if( ($Command||'') =~ /^(daily|weekly|monthly|yearly)$/ );
+		my @s = split( /[\r\n]+/, $str );
+		foreach my $se (@s) {
+			print LOG "$tag $se\n";
+		}
+		close(LOG) or warn "Error: Couldn't close logfile $logfile\n";
+		chown( 0, 101, $logfile );
+		chmod( 0640, $logfile );
+	}
+	push( @Messages, $str );
+}
+
+sub dbg( $ ) {
+	if( ($job{'Debug'}||'') eq 'yes' ) {
+		lg( shift(@_) );
+	} else {
+		push( @Messages, @_ );
+	}
+}
+
+
+sub ExecCmd( \@$ ) {
+	(my $cmdRef, my $forcelog) = @_;
+	my @cmd = @$cmdRef;
+	my $pipestatus='';
+	$forcelog=1 if $job{'Debug'};
+	die "Fork failed: $!\n" unless defined( my $pid=open(RCHILD, "-|"));
+	if( $pid ) {
+		$ExecCmdOutout='';
+		while(<RCHILD>) {
+			chomp( $_ );
+			next if $_ eq '';
+			dbg( "Exec Out: $pipestatus" ) if $forcelog and $pipestatus; # one step offset
+			s/\e\[[0-9\;]+[A-Za-z]//g; # remove ANSI escape sequences
+			$ExecCmdOutout.="$_\n";
+			$pipestatus=$_;
+		}
+		close( RCHILD );
+	} else {
+		dbg( "Exec Cmd: @cmd" );
+		exec( "@cmd 2>&1; echo \${PIPESTATUS}" ) or die "exec failed: $!\n";
+	}
+	$ExecCmdOutout =~ s/$pipestatus\n$//;
+	$pipestatus =  $? if not $pipestatus;
+	dbg( "Exec Out: exitstatus=$pipestatus" ) if $forcelog;
+	return $pipestatus;
+}
+
+sub trim($) {
+	my $s=shift;
+	$s=~s/^\s+//;
+	$s=~s/\s+$//;
+	return $s;
+}
+
+sub formatHTime($) {
+	my $ts=shift(@_);
+	my ($y,$m,$d,$H,$M)=$ts=~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d)/ ;
+	return Date::Format::time2str("%a %Y-%m-%d %H:%M",(timelocal(0,$M,$H,$d,$m-1,$y))) ;
+}
+
+sub hTime2Timestamp($) {
+	my $ts=shift(@_);
+	my ($y,$m,$d,$H,$M)=$ts=~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d)/ ;
+	return timelocal(0,$M,$H,$d,$m-1,$y) ;
+}
+
+sub countUnit($) {
+	my $count = shift(@_);	
+	my $unit = "";
+	if( $count > 9999E9 ) {
+		$count = int(($count+0.5E12)/1E12);
+		$unit = "T";
+	} elsif( $count > 9999E6 ) {
+		$count = int(($count+0.5E9)/1E9);
+		$unit = "G";
+	} elsif( $count > 9999E3 ) {
+		$count = int(($count+0.5E6)/1E6);
+		$unit = "M";
+	} elsif( $count > 9999E0 ) {
+		$count = int(($count+0.5E3)/1E3);
+		$unit = "k";
+	}
+	$count .= "$unit";
+	return $count;
+}
+
+sub timeUnit($) {
+	my $res='';
+	my $t = shift(@_);	
+	my $days = int($t/86400); $t -= $days*86400;
+	my $hours = int($t/3600); $t -= $hours*3600;
+	my $minutes = int($t/60); 
+	my $seconds = $t - $minutes*60;
+	if($days) {
+		$res=sprintf("%dd%02dh", $days, $hours);
+	} elsif($hours) {
+		$res=sprintf("%2dh%02dm", $hours, $minutes);
+	} else {
+		$res=sprintf("%2dm%02ds", $minutes, $seconds);
+	}
+	return $res;
+}
+
+sub sizeUnit($) {
+	my $size = shift(@_);	
+	my $unit = '';
+	if( $size > 1024**4 ) {
+		$size = $size/1024**4;
+		$unit = "T";
+	} elsif( $size > 1024**3 ) {
+		$size = $size/1024**3;
+		$unit = "G";
+	} elsif( $size > 1024**2 ) {
+		$size = $size/1024**2;
+		$unit = "M";
+	} elsif( $size > 1024 ) {
+		$size = $size/1024;
+		$unit = "k";
+	} if(  $unit && length(sprintf( "%2.1f",$size))<=3) {
+		$size = sprintf( "%2.1f", $size);
+	} else {
+		$size = sprintf( "%3.0f", $size);
+	}
+	return "$size$unit";
+}
+
+
+#################################################################################################################################################################
+######################################################### début des modifs: ajout à partir de Affa2
+
+sub riseFromDeath()
+	{
+	$SIG{'INT'} = sub{};
+	$interactive=1;
+	my @cmd;
+	my $bootstrap=$config->get_prop("bootstrap-console","Run");
+	my $jobname=$ARGV[0]||'';
+	my $archive=$ARGV[1]||'scheduled.0';
+#######################################################################################################################################################################	
+################################################################ ligne d'origine d'Affa2: getJobConfig( $jobname );
+	%job=getJobConfig( $jobname );
+#########################################################################################################
+#########################################################################################################################################################################
+	if( $job{'remoteHostName'} eq 'localhost' )
+		{
+		$interactive=0;
+		my $txt;
+		$txt="Error: A rise cannot be done for this server from it's own backup.";
+		lg( $txt ); print "$txt\n";
+		$txt="Try option --full-restore instead.";
+		lg( $txt ); print "$txt\n";
+		affaErrorExit( "Cannot rise from my own backup." );
+		}
+
+
+	if( $job{'AutomountDevice'} and $job{'AutomountPoint'} )
+		{
+		mount( $job{'AutomountDevice'},  $job{'AutomountPoint'}, $job{'AutomountOptions'} );
+		}
+
+	# check if archive exists
+#########################################################################ligne d'origine:	checkArchiveExists($job{'RootDir'},$jobname,$archive); 		remplacée par:
+	checkArchiveExists($jobname,$archive);
+
+	# check if other affa jobs are running
+#########################################################################ligne d'origine supprimée:	my %all = $affa->as_hash();
+	my $havelocks=0;
+######################################################################### début des modifs  // commentés avec un #: script d'origine de AffaV2
+#	foreach my $job( reverse sort keys %all )
+#		{
+#		next if $job eq $ServerBasename;
+#		my $v=$all{$job};
+#		next if $v->{'type'} ne 'job';
+#		my $lockpid=getLock("$lockdir/$job");
+
+	foreach my $jobname( sort $cfg->Sections() ) {
+		next if $jobname eq $ServerBasename ;
+
+###################################################################### fin des modifs								
+
+		my $lockpid=getLock($jobname);
+		if( $lockpid )
+			{
+########################################################################my $txt = "Job '$job' is running (pid $lockpid)";			
+			my $txt = "Job '$jobname' is running (pid $lockpid)";
+			print "$txt\n"; lg($txt);
+			$havelocks++;
+			$interactive=0;
+			}
+		}
+	if( not $interactive )
+		{
+		print "Wait for completion of the running jobs or kill them. Then run affa --rise again.\n";
+		affaErrorExit( "affa jobs are running." );
+		}
+
+	stopServices();
+
+	if( $bootstrap ne 'no' )
+		{
+		print "*************************************************************\n";
+		print "* WARNING:                                                  *\n";
+		print "* Bootstrap-console Run flag is set.                        *\n";
+		print "* It appears as if affa --rise has already run.             *\n";
+		print "* Skipping backup run of affa server base (this server)     *\n";
+		print "*************************************************************\n";
+		}
+	else
+		{
+		saveMySoul();
+		}
+
+##########################################################################################################################################################
+############################################################################################# début modifs
+	%job=getJobConfig( $jobname );
+
+############################################################################################# fin modifs
+###########################################################################################################################################################
+
+	if( checkCrossFS( $job{'RootDir'}, "/usr/lib/affa" ) )
+		{
+		print "*************************************************************\n";
+		print "* WARNING:                                                  *\n";
+		print "* The archive is not on the local filesystem, therefore     *\n";
+		print "* hardlinks cannot be used und all data need to be copied.  *\n";
+		print "* Depending on the size of the archive this can take a long *\n";
+		print "* time.                                                     *\n";
+		print "*************************************************************\n";
+		}
+	my $input='';
+	while( not $input =~ /^(proceed|quit|exit)$/ )
+		{
+		print "Type 'proceed' to continue or 'quit' to exit: ";
+		$input = lc(<STDIN>);
+		chomp( $input );
+		}
+	if( $input ne 'proceed' )
+		{
+		$interactive=0;
+		affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+		}
+
+	print "Signaling pre-restore event\n";
+	@cmd=("/sbin/e-smith/signal-event", "pre-restore");
+	ExecCmd( @cmd, 0 );
+
+	$config = esmith::ConfigDB->close;
+
+# #########################################################################################   ligne d'origine AffaV2:	runRiseRsync("$job{'RootDir'}/$jobname/$archive/", "/");
+	runRiseRsync($jobname, "$job{'RootDir'}/$jobname/$archive/", "/");
+	$config = esmith::ConfigDB->open or die "Error: Couldn't open config db.";
+
+	imapIndexFilesDelete();
+
+	print "Signaling post-upgrade event\n";
+	@cmd=("/sbin/e-smith/signal-event", "post-upgrade");
+	ExecCmd( @cmd, 0 );
+
+########################################################################################################################################################
+	# preserve ethernet driver configuration for this hardware.
+	# This allows us to run the --rise option remotely and connect to the restored server
+
+	my $srcconfigPath="/var/affa/$ServerBasename/scheduled.0/home/e-smith/db/configuration";
+	my $srcconfig = esmith::ConfigDB->open_ro($srcconfigPath)
+		or affaErrorExit( "Couldn't open source config db $srcconfigPath");
+	$config->set_prop("EthernetDriver1","type", $srcconfig->get("EthernetDriver1")->value);
+	$config->set_prop("EthernetDriver2","type", $srcconfig->get("EthernetDriver2")->value);
+	$config->set_prop("InternalInterface","Driver", $srcconfig->get_prop("InternalInterface","Driver"));
+	$config->set_prop("InternalInterface","Name", $srcconfig->get_prop("InternalInterface","Name"));
+	$config->set_prop("InternalInterface","NICBondingOptions", $srcconfig->get_prop("InternalInterface","NICBondingOptions"));
+	$config->set_prop("InternalInterface","NICBonding", $srcconfig->get_prop("InternalInterface","NICBonding")||'disabled');
+
+	print "Please make sure that the server '".$job{'remoteHostName'}."' is not connected to your network.\n";
+	print "Otherwise you will not be able to connect to this server after the reboot.\n";
+	print "Please reboot this server now.\n"
+	}
+
+sub undoRise()
+	{
+	my @cmd;
+	$interactive=1;
+	# search server base backup
+	my $dir = opendir( DIR, "/var/affa/" );
+	affaErrorExit( "Couldn't open directory /var/affa/" ) if not $dir;
+	my $archive;
+	my $a='';
+	while( defined ($archive=readdir(DIR)) )
+		{
+		next if not $archive =~ /AFFA\.[a-z][a-z0-9\-]*\..*-\d*\.\d*\.\d*\.\d*/;
+		$a=$archive;
+		}
+	affaErrorExit( "No server base backup found." ) if not $a and not -f "$a/scheduled.0";
+	stopServices();
+	print "\nWARNING: You will loose all data of your current server installation!\n";
+	my $input='';
+	while( not $input =~ /^(proceed|quit|exit)$/ )
+		{
+		print "Type 'proceed' to continue or 'quit' to exit: ";
+		$input = lc(<STDIN>);
+		chomp( $input );
+		}
+	if( $input ne 'proceed' )
+		{
+		$interactive=0;
+		affaErrorExit( "Terminated by user" ) if $input ne 'proceed';
+		}
+
+	print "Signaling pre-restore event\n";
+	@cmd=("/sbin/e-smith/signal-event", "pre-restore");
+	ExecCmd( @cmd, 0 );
+
+	runRiseRsync($jobname, "/var/affa/$a/scheduled.0/", "/");
+
+	imapIndexFilesDelete();
+
+	print "Signaling post-upgrade event\n";
+	@cmd=("/sbin/e-smith/signal-event", "post-upgrade");
+	ExecCmd( @cmd, 0 );
+
+	print "affa server base restored. Please reboot now.\n"
+	}
+sub runRiseRsync($$$)
+	{
+	(my $jobname,my $archive,my $dest)=@_;
+# #########################################################################################   ligne d'origine AffaV2: (my $archive,my $dest)=@_;
+
+	my $b = new esmith::Backup or die "Error: Couldn't create Backup object\n";
+# #########################################################################################   ligne d'origine AffaV2: 	my @SourceDirs = $opts{'all'} ? getSourceDirs() : $b->restore_list;
+	my @SourceDirs = $opts{'all'} ? getSourceDirs($jobname) : $b->restore_list;
+
+	if ( $jobname eq 'undo-rise' )
+		{
+		push( @SourceDirs, "etc/affa" );
+		}
+
+	my $txt='Running rsync...'; lg($txt); print "$txt\n";
+	foreach my $src (@SourceDirs)
+		{
+		$src =~ s/"/\\"/g;
+		chomp( $src );
+		$src = "$src/" if -d "$archive$src";
+
+		my @cmd=(
+			"/usr/bin/rsync",
+			"--archive",
+			"--stats",
+			"--delete-during", "--ignore-errors", 
+			"--delete-excluded",
+			"--partial",
+			"--inplace",
+			"--numeric-ids",
+			"--link-dest=$archive$src",
+			"$archive$src",	
+			"$dest$src",
+			);
+		print "/$src: ";
+		my $status=ExecCmd(  @cmd, 0 );
+		if( $status==0 or $status == 23 or $status == 24 )
+			{
+###########			$Affa::lib::ExecCmdOutout =~ /(Total file size: [0-9]* bytes)/gm;
+			$ExecCmdOutout =~ /(Total file size: [0-9]* bytes)/gm;
+			print "OK. $1\n";
+			}
+		else
+			{
+			print "Failed.\n";
+			}
+		}
+	}
+
+
+sub stopServices()
+	{
+	lg( "Stopping services...");
+	my @cmd;
+	foreach my $svc (@services)
+		{
+		@cmd=('/sbin/e-smith/service', $svc, 'stop');
+		ExecCmd( @cmd, 0 );
+#		print $Affa::lib::ExecCmdOutout;
+		print $ExecCmdOutout;
+		}
+	$ServicesStopped=1;
+	}
+
+sub startServices()
+	{
+	lg( "Starting services...");
+	my @cmd;
+	foreach my $svc (@services)
+		{
+		@cmd=('/sbin/e-smith/service', $svc, 'start');
+		ExecCmd( @cmd, 0 );
+#		print $Affa::lib::ExecCmdOutout;
+		print $ExecCmdOutout;
+		}
+	$ServicesStopped=0;
+	}
+
+sub saveMySoul()
+	{
+	my $txt = 'Backing up the Affa server base (this server).';
+	print "$txt\n"; lg($txt);
+
+#####################################################################################################################################################
+################################################## début copie de sme-affa-conf2ini.perl avec modifs AG
+############################################################### faire attention: $ServerBasename.conf dans /root et /root est écrasé par sub runRiseRsync($$)
+
+#	File::Path::mkpath( "/root/affa3conf/", 0, 0755 );
+	open( CF, ">/etc/affa/$ServerBasename.conf"); 
+	print CF "[$ServerBasename]\n";
+#	foreach my $k ( sort keys %job )
+#		{
+#		my $key=$k;
+#		if( $k=~/^Include\[/ ){
+#			$key="Include";
+#		} elsif( $k=~/^Exclude\[/ ){
+#			$key="Exclude";
+#		} elsif( $k=~/TimeSchedule/ ){
+#			my @ts = split(/,/, $job{$k});
+#			foreach my $s (sort @ts) {
+#				print CF "TimeSchedule=$s\n";
+#			}
+#			next;
+#		} elsif( $k=~/EmailAddresses/ ){
+#			my @ts = split(/,/, $job{$k});
+#			foreach my $s (sort @ts) {
+#				next if $s eq 'admin';
+#				print CF "EmailAddress=$s\n";
+#				$postprefix="WARNING: EmailAddress=admin skipped!";
+#			}
+#			next;
+#		} elsif( $k eq 'SMEServer' && $job{$k} eq 'yes' ) {
+#			print CF "Include=/etc/e-smith/templates-custom\n";
+#			print CF "Include=/etc/e-smith/templates-user-custom\n";
+#			print CF "Include=/etc/group\n";
+#			print CF "Include=/etc/gshadow\n";
+#			print CF "Include=/etc/passwd\n";
+#			print CF "Include=/etc/samba/secrets.tdb\n";
+#			print CF "Include=/etc/samba/smbpasswd\n";
+#			print CF "Include=/etc/shadow\n";
+#			print CF "Include=/etc/smbpasswd\n";
+#			print CF "Include=/etc/ssh\n";
+#			print CF "Include=/etc/sudoers\n";
+#			print CF "Include=/home/e-smith\n";
+#			print CF "Include=/root\n";
+#			print CF "preJobCommandRemote=SME/signal-pre-backup\n";
+#			print CF "postJobCommandRemote=SME/signal-post-backup\n";
+#		} elsif( $k =~ /JobCommand$/ && $job{$k} =~ /^\// ) {
+#			$postprefix="WARNING: preJobCommand/postJobCommand needs fix!";
+#			$job{$k} =~ s/.*\///;
+#		}
+#		next if( ! defined $defs{$key} );
+#		next if( $defs{$key} eq $job{$k} );
+#		print CF "$key=$job{$k}\n" if $job{$k};
+#		}
+
+	print CF "remoteHostName=localhost\n";
+	print CF "Description=for internal use only\n";
+	print CF "scheduledKeep=1\n";
+	print CF "dailyKeep=1\n";
+	print CF "weeklyKeep=1\n";
+	print CF "monthlyKeep=1\n";
+	print CF "yearlyKeep=1\n";
+	print CF "SMEServer=yes\n";
+	print CF "DiskSpaceWarn=none\n";
+	print CF "status=disabled\n";
+	print CF "RetryAfter=0\n";
+	print CF "RetryAttempts=0\n";
+	close(CF);
+
+
+#	File::Path::mkpath( "/var/affa/", 0, 0755 );
+#	open( DD, ">/var/affa/$ServerBasename/.doneDates.conf"); 
+#	print DD "[doneDates]\n";
+#	print DD "daily=$thisDay\n";
+#	print DD "weekly=$thisWeek\n";
+#	print DD "monthly=$thisMonth\n";
+#	print DD "yearly=$thisYear\n";	
+#	close(DD);	
+
+#	print "/root/affa3conf/$xjob.conf created. $postprefix\n";
+	print "/etc/affa/$ServerBasename.conf created.\n";
+
+################################################################################################### fin de la copie de sme-affa-conf2ini.perl et des modifs AG
+##################################################################################################################################################################
+
+
+#	my $asb = $affa->get($ServerBasename);
+#	$asb->delete() if $asb;
+#	my $me = $affa->new_record($ServerBasename);
+#	$me->set_prop('type','job');
+#	my %props=(
+#		'remoteHostName'=>'localhost',
+#		'RootDir'=>'/var/affa',
+#		'TimeSchedule'=>'',
+#		'Description'=>'for internal use only',
+#		'scheduledKeep'=>1,
+#		'dailyKeep'=>1,
+#		'weeklyKeep'=>1,
+#		'monthlyKeep'=>1,
+#		'yearlyKeep'=>1,
+#		'SMEServer'=>'yes',
+#		'RPMCheck'=>'no',
+#		'DiskSpaceWarn'=>'none',
+#		'localNice'=>'+19',
+#		'remoteNice'=>0,
+#		'Watchdog'=>'no',
+#		'ConnectionCheckTimeout'=>120,
+#		'rsyncTimeout'=>900,
+#		'rsyncCompress'=>'yes',
+#		'EmailAddresses'=>'admin',
+#		'postJobCommand'=>'',
+#		'preJobCommand'=>'',
+#		'doneDaily'=>$thisDay,
+#		'doneMonthly'=>$thisMonth,
+#		'doneWeekly'=>$thisWeek,
+#		'doneYearly'=>$thisYear,
+#		'status'=>'disabled',
+#		'Debug'=>'no',
+#		);
+#	while( (my $p, my $v) = each %props )
+#		{
+#		 $me->set_prop($p,$v);
+#		}
+
+
+
+############################################################################################################################################
+##############################################################################début modifs
+	%job=getJobConfig( $ServerBasename );
+############################################################################## fin modifs
+############################################################################################################################################
+
+
+	if( not -d $job{'RootDir'} ) {
+		my $input='';
+		while( not $input =~ /^(yes|no)$/ ) {
+			print "Directory $job{'RootDir'} does not exist. Create? (yes|no) ";
+			$input = lc(<STDIN>);
+			chomp( $input );
+		}
+		if( $input ne 'yes' ) {
+			$interactive=0;
+			affaErrorExit( "Terminated by user" );
+		}
+		File::Path::mkpath( $job{'RootDir'}, 0, 0700 );
+		}
+
+################################################# ligne d'origine de AffaV2: my @cmd=('/sbin/e-smith/affa','--run', $ServerBasename);
+	my @cmd=('/sbin/affa','--run', $ServerBasename); 	
+
+
+
+	not ExecCmd( @cmd, 0 ) or affaErrorExit( "Couldn't backup myself" );
+	print "Done.\n";
+	}
+
+sub imapIndexFilesDeleteCommand()
+	{
+	return 'USERS=`/usr/bin/find /home/e-smith/files/users -type d -maxdepth 1`;USERS="/home/e-smith/ $USERS"; for u in $USERS ;  do ! /usr/bin/test -d $u/Maildir && continue; /usr/bin/find $u/Maildir -maxdepth 2 -type f -name ".imap.index*" -exec /bin/rm -f \'{}\' \; ; /usr/bin/find $u/Maildir -maxdepth 2 -type f -name "dovecot.index*" -exec /bin/rm -f \'{}\' \; ; done';
+	}
+
+sub imapIndexFilesDelete()
+	{
+	# Sometimes Dovecot index files are corrupted after a restore
+	# It is save to delete them all. Dovecot will rebuild them when the mailbox is accessed.
+	print "Deleting Dovecot's index files\n";
+	my @cmd=( imapIndexFilesDeleteCommand() );
+	ExecCmd( @cmd, 0 );
+	}
+
+################################################################################################### fin des modifs
+###################################################################################################################################################################################
+
+
+
+END {
+	unlink($configfile) if $configfile;
+}

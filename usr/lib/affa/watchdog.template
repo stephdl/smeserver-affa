@@ -1,0 +1,90 @@
+#!/usr/bin/perl -wT
+
+#----------------------------------------------------------------------
+# affa watchdog
+#
+# This script is part of the smeserver-affa package
+#
+# Copyright (C) 2008 Michael Weinberger, neddix Stuttgart, Germany
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+# 
+#----------------------------------------------------------------------
+
+use strict;
+use Errno;
+use esmith::DB::db;
+use esmith::ConfigDB;
+use Date::Format;
+use File::Path;
+use Mail::Send;
+
+use constant _TRIGGER=>200703281100;
+use constant _JOBNAME=>'nx scheduled';
+use constant _EMAIL=>'mweinber@neddix.de';
+use constant _BACKUPHOST=>'backup.neddix.de (172.22.32.2)';
+use constant _SCHEDULED=>'Wed Mar 28 13:10:14 2007';
+use constant _WDSCRIPT=>'affa-watchdog-nx-172.22.32.6';
+
+BEGIN
+	{
+	# Clear PATH and related environment variables so that calls to
+	# external programs do not cause results to be tainted. See
+	# "perlsec" manual page for details.
+	
+	$ENV {'BASH_ENV'} = '';
+	$ENV {'PATH'} = '';
+	}
+
+sub sendEmail($);
+
+my $now = Date::Format::time2str("%Y%m%d%H%M",time());
+my $nowHour = int(Date::Format::time2str("%k",time()));
+
+exit 0 if( $now<(_TRIGGER) );
+
+(my $Reminder = (_TRIGGER)) =~ s/........(..)../$1/;
+$Reminder=int($Reminder);
+
+if( -f "/etc/cron.hourly/".(_WDSCRIPT) ) # send the first warning
+	{
+	sendEmail('');
+	rename( "/etc/cron.hourly/".(_WDSCRIPT), "/etc/cron.hourly/".(_WDSCRIPT)."-reminder" );
+	}
+elsif( $now-(_TRIGGER) > 1200 and $nowHour==$Reminder ) # send daily reminder 
+	{
+	sendEmail(' (Reminder) ');
+	}
+
+exit 0;
+
+sub sendEmail($)
+	{
+	my $config = esmith::ConfigDB->open_ro or die "Could not open config db.";
+	my $LocalIP=$config->get("LocalIP")->value;
+	my $SystemName=$config->get("SystemName")->value;
+	my $DomainName=$config->get("DomainName")->value;
+	my $reminder=shift(@_);
+	my $msg = new Mail::Send;
+	$msg->subject("Error: ".$reminder."Scheduled affa job '".(_JOBNAME)."' did not run on ".(_BACKUPHOST)."");
+	$msg->to(_EMAIL);
+	$msg->set("From", "\"Affa watchdog on $SystemName.$DomainName ($LocalIP)\" <noreply\@$SystemName.$DomainName>");
+	my $fh = $msg->open;
+	print $fh "The backup job '".(_JOBNAME)."' scheduled on ".(_SCHEDULED)." did not run.\n";
+	print $fh "Please check and fix your affa configuration on ".(_BACKUPHOST).".\n";
+	print $fh "A reminder message will be sent at $Reminder:00 hours, if the error continues unchecked.\n\n";
+	print $fh "Remove the file /etc/cron.hourly/".(_WDSCRIPT)."-reminder to stop receiving reminder messages.\n";
+	$fh->close; 
+	}

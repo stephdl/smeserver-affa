@@ -1,0 +1,22 @@
+[localSME]
+remoteHostName=localhost
+SMEServer=yes
+Watchdog=yes
+ConnectionCheckTimeout=120
+Debug=no
+Description=Testjob localhost for SME comlete configuration
+DiskSpaceWarn=strict
+RootDir=/var/affa
+TimeSchedule=0215
+localNice=15
+remoteNice=15
+rsync--inplace=yes
+rsyncCompress=no
+rsyncTimeout=900
+scheduledKeep=1
+sshPort=22
+dailyKeep=7
+weeklyKeep=4
+monthlyKeep=12
+yearlyKeep=1
+status=enabled

@@ -1,0 +1,8 @@
+[localSME]
+remoteHostName=localhost
+SMEServer=yes
+Watchdog=yes
+Description=Testjob localhost for SME minimal configuration
+RootDir=/var/affa
+TimeSchedule=0215
+

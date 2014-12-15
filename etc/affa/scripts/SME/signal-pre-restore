@@ -1,0 +1,2 @@
+#!/bin/sh
+/sbin/e-smith/signal-event pre-restore desktop

@@ -1,0 +1,5 @@
+/var/log/affa/*.log {
+    weekly
+    rotate 5
+    missingok
+}

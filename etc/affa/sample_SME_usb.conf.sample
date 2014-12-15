@@ -1,0 +1,25 @@
+[SME_SME]
+remoteHostName=IP_SME_to_backup
+SMEServer=yes
+Watchdog=yes
+RPMCheck=yes
+ConnectionCheckTimeout=120
+Debug=no
+Description=Testjob backup of a SME on the usb hard-drive of a SME 
+DiskSpaceWarn=strict
+RootDir=/mnt/hard_drive
+AutomountDevice=/dev/sdc1
+AutomountPoint=/mnt/hard_drive
+AutoUnmount=yes
+TimeSchedule=0215
+localNice=15
+remoteNice=15
+rsync--inplace=yes
+rsyncCompress=no
+rsyncTimeout=900
+scheduledKeep=1
+dailyKeep=7
+weeklyKeep=4
+monthlyKeep=12
+yearlyKeep=1
+status=enbabled

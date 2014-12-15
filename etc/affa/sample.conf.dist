@@ -1,0 +1,5 @@
+[samplejob]
+remoteHostName=192.168.1.100
+sshPort=22
+Include=/root
+Include=/home
