@@ -10,7 +10,7 @@
 # This is free software, and you are welcome to redistribute it
 # under certain conditions; type 'affa --license' for details.
 #----------------------------------------------------------------------
-my $VERSION='3.2.2-2';
+my $VERSION='3.2.2.2-0';
 #----------------------------------------------------------------------
 
 use strict;
@@ -1857,7 +1857,7 @@ sub listArchives() {
 
 ################### début modifs
 #			($h = sprintf "+-%076s-+\n", '-') =~ s/0/-/g;
-			($h = sprintf "+-%0102s-+\n", '-') =~ s/0/-/g;
+			($h = sprintf "+-%0110s-+\n", '-') =~ s/0/-/g;
 
 			$out .= $h;
 
@@ -1866,21 +1866,21 @@ sub listArchives() {
 #			$out .= sprintf( "| Directory: %-65s |\n", $job{'RootDir'}."/$jobname/" );
 #			$out .= sprintf( "| Hostname: %-66s |\n", $job{'remoteHostName'} );
 
-			$out .= sprintf( "| Job: %-97s |\n", $jobname );
-			$out .= sprintf( "| Description: %-89s |\n", $job{'Description'} ) if $job{'Description'};
-			$out .= sprintf( "| Directory: %-91s |\n", $job{'RootDir'}."/$jobname/" );
-			$out .= sprintf( "| Hostname: %-92s |\n", $job{'remoteHostName'} );
+			$out .= sprintf( "| Job: %-105s |\n", $jobname );
+			$out .= sprintf( "| Description: %-97s |\n", $job{'Description'} ) if $job{'Description'};
+			$out .= sprintf( "| Directory: %-99s |\n", $job{'RootDir'}."/$jobname/" );
+			$out .= sprintf( "| Hostname: %-100s |\n", $job{'remoteHostName'} );
 
 
 			if( $job{'AutomountDevice'} and $job{'AutomountPoint'} ) {
-				$out .= sprintf( "| AutomountDevice: %-59s |\n", $job{'AutomountDevice'} );
-				$out .= sprintf( "| AutomountPoint: %-60s |\n", $job{'AutomountPoint'} );
-				$out .= sprintf( "| AutoUnmount: %-63s |\n", $job{'AutoUnmount'} );
+				$out .= sprintf( "| AutomountDevice: %-93s |\n", $job{'AutomountDevice'} );
+				$out .= sprintf( "| AutomountPoint: %-94s |\n", $job{'AutomountPoint'} );
+				$out .= sprintf( "| AutoUnmount: %-97s |\n", $job{'AutoUnmount'} );
 			}
 			my $etxt="Email:";
 			foreach my $s (@{$job{'EmailAddress'}}) {
 #				$out .= sprintf( "| %6s %-69s |\n", $etxt, trim($s) );
-				$out .= sprintf( "| %6s %-95s |\n", $etxt, trim($s) );
+				$out .= sprintf( "| %6s %-103s |\n", $etxt, trim($s) );
 
 				$etxt='';
 			}
@@ -1904,7 +1904,8 @@ sub listArchives() {
 
 
 				my $TotalFileSize = ($valid and $c[4]) ? sizeUnit($c[4]) : '-';
-				my $TotalBytesReceived = ($valid and $c[8]>=0) ? sizeUnit($c[8]) : '-';
+                                my $TotalBytesSent = ($valid and $c[8]>=0) ? sizeUnit($c[8]) : '-';
+				my $TotalBytesReceived = ($valid and $c[9]>=0) ? sizeUnit($c[9]) : '-';
 				my $DiskUsage = ($valid and $c[5] and $c[6]) ? sizeUnit($c[6]*1024) . "/" . int($c[6]/($c[5]+$c[6])*100) . "%" : '-';
 				my $idx = sprintf '%s%2d', uc(substr($c[0],0,1)),$c[1];
 				my $ExecTime = !$valid || $c[9] eq '-' ? '-' : timeUnit($c[9]);
@@ -1937,9 +1938,9 @@ sub listArchives() {
 # ligne du patch Affa2		$out2 .= sprintf( "| %-5s | %-21s | %9s | %40s | %6s | %6s |\n", $idx,$date,$ExecTime,$NumberOfFiles,$TotalFileSize,$TotalBytesReceived );
 
 # lignes modifiée AG
-					$out2 .= sprintf( "|%-5s | %-42s | %9s | %6s | %5s | %5s | %5s | %5s |\n",
+					$out2 .= sprintf( "|%-5s | %-42s | %9s | %6s | %5s | %5s | %5s | %5s | %5s |\n",
 					$idx,$date,$ExecTime,$DedupExectime,$DedupSavedBytes,
-					$NumberOfFiles,$TotalFileSize,$TotalBytesReceived );
+					$NumberOfFiles,$TotalFileSize,$TotalBytesSent,$TotalBytesReceived );
 
 
 
@@ -1953,7 +1954,7 @@ sub listArchives() {
 # ligne d'origine		$out .= sprintf "| %-3s | %-20s | %6s | %6s | %5s | %5s | %5s | %5s |\n", 'Run','Completion date', 'buTime', 'ddTime', 'ddYld', 'Files', 'Size', 'Recvd';
 # ligne du patch Affa2		$out .= sprintf "| %-5s | %-21s | %9s | %-40s | %6s | %6s |\n", "Run","Completion date", "Exec Time", "Files", "Size", "Recvd";
 # ligne modifiée AG ci-dessous
-				$out .= sprintf "| %-5s | %-41s | %9s | %6s | %5s | %5s | %5s | %5s |\n", 'Run','Completion date', 'buTime', 'ddTime', 'ddYld', 'Files', 'Size', 'Recvd';
+				$out .= sprintf "| %-5s | %-41s | %9s | %6s | %5s | %5s | %5s | %5s | %5s |\n", 'Run','Completion date', 'buTime', 'ddTime', 'ddYld', 'Files', 'Size', 'Sent', 'Recvd';
 
 
 			} else {
@@ -2001,6 +2002,7 @@ sub listArchivesRaw($) {
 		my $Date=0;
 		my $NumberOfFiles=0;
 		my $TotalFileSize=0;
+                my $TotalBytesSent=0;
 		my $TotalBytesReceived=0;
 		my $RootDirFilesystemAvail=0;
 		my $valid="no";
@@ -2021,6 +2023,7 @@ sub listArchivesRaw($) {
 			$NumberOfFiles=$rpt->val('Report','NumberOfFiles');
 
 			$TotalFileSize=$rpt->val('Report','TotalFileSize');
+                        $TotalBytesSent=$rpt->val('Report','TotalBytesSent');
 			$TotalBytesReceived=$rpt->val('Report','TotalBytesReceived');
 # ligne du patch affa2	(my $TotalFileSize=$v->prop('TotalFileSize')||0) =~ s/(\D*)*/$1/g;
 # ligne du patch affa2	(my $TotalBytesReceived=$v->prop('TotalBytesReceived')||0) =~ s/(\D*)*/$1/g;
@@ -2046,6 +2049,7 @@ sub listArchivesRaw($) {
 			. ";". $RootDirFilesystemAvail
 			. ";". $RootDirFilesystemUsed
 			. ";". $valid
+			. ";". $TotalBytesSent
 			. ";". $TotalBytesReceived
 			. ";". $ExecutionTime
 			. ";". $DedupTotalFiles
