@@ -1908,7 +1908,7 @@ sub listArchives() {
 				my $TotalBytesReceived = ($valid and $c[9]>=0) ? sizeUnit($c[9]) : '-';
 				my $DiskUsage = ($valid and $c[5] and $c[6]) ? sizeUnit($c[6]*1024) . "/" . int($c[6]/($c[5]+$c[6])*100) . "%" : '-';
 				my $idx = sprintf '%s%2d', uc(substr($c[0],0,1)),$c[1];
-				my $ExecTime = !$valid || $c[9] eq '-' ? '-' : timeUnit($c[9]);
+				my $ExecTime = !$valid || $c[10] eq '-' ? '-' : timeUnit($c[10]);
 				if( $c[1]>=$job{$c[0]."Keep"} ) {
 					$idx = "*$idx";
 					$tag++;
@@ -1922,9 +1922,9 @@ sub listArchives() {
 				my $DedupSavedBytes='-';
 				my $DedupExectime='-';
 
-				if( defined $c[13] && $c[13] ne '' ) {
-					$DedupSavedBytes=sizeUnit($c[12]);
-					$DedupExectime=timeUnit($c[13]);
+				if( defined $c[14] && $c[14] ne '' ) {
+					$DedupSavedBytes=sizeUnit($c[13]);
+					$DedupExectime=timeUnit($c[14]);
 				}
 				if( $idx =~ /S.0/ && getProcessState($jobname) =~ /deduplicating/) {
 					$DedupSavedBytes='busy';
