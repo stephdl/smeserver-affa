@@ -1701,7 +1701,7 @@ sub execJobCommandRemote($$) {
 			$job{'remoteHostName'}, 
 			$jobname, 
 		);
-		not ExecCmd( @cmd, 0 ) or affaErrorExit( "Executing script $scrname on $job{'RemoteHostName'} failed." );
+		not ExecCmd( @cmd, 0 ) or affaErrorExit( "Executing script $scrname on $job{'remoteHostName'} failed." );
 
 		}
 }

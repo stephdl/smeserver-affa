@@ -1,8 +1,8 @@
 Summary: A rsync-based backup program for linux, adapted to sme server 8
 %define name smeserver-affa
 Name: %{name}
-%define version 3.2.2.2
-%define release 1
+%define version 3.2.2.3
+%define release 0
 Version: %{version}
 Release: %{release}%{?dist}
 Vendor: Michael Weinberger <mweinber AT users DOT sourceforge DOT net> //// adaptation to sme-server Arnaud Guillaume <smeserver-affa AT guedel DOT eu>
@@ -83,7 +83,7 @@ exit 0
 exit 0
 
 %changelog
-* Tue Jan 13 2015 mats schuh <m.schuh@neckargeo.net> 3.2.2.2-1
+* Tue Jan 13 2015 mats schuh <m.schuh@neckargeo.net> 3.2.2.3
 - Added TotalBytesSent to archive reports and fixed report layout
 
 * Sun Dec 07 2014 Arnaud Guillaume 3.2.2.2
