@@ -1,7 +1,7 @@
 Summary: A rsync-based backup program for linux, adapted to sme server 8
 %define name smeserver-affa
 Name: %{name}
-%define version 3.2.2.2
+%define version 3.2.2.3
 %define release 1
 Version: %{version}
 Release: %{release}%{?dist}
@@ -83,6 +83,12 @@ exit 0
 exit 0
 
 %changelog
+* Tue Sep 22 2015 stephane de Labrusse <stephdl@de-labrusse.fr> 3.2.2.3-1
+- fixed column ExecTime shift
+- Adjusted column indices in report
+- Fixed typo in remoteHostName [SME: 9062]
+- Code done by mats schuh <m.schuh@neckargeo.net>
+
 * Tue Jan 13 2015 mats schuh <m.schuh@neckargeo.net> 3.2.2.2-1
 - Added TotalBytesSent to archive reports and fixed report layout
 
